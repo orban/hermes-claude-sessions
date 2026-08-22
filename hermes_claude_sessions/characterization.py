@@ -31,6 +31,7 @@ REQUIRED_FLAGS = (
     "--effort",
 )
 REQUIRED_COMMANDS = ("attach", "logs", "stop", "respawn", "rm", "agents")
+REQUIRED_AGENT_OBJECT_KEYS = frozenset(("id", "name", "state"))
 SAFE_COMMANDS: tuple[tuple[str, ...], ...] = (
     ("--version",),
     ("--help",),
@@ -166,6 +167,19 @@ def run_command(
     return _run_command(
         normalized_argv, timeout_seconds=timeout_seconds, output_limit=output_limit
     )
+
+
+def validate_agents_json_payload(payload: Any) -> None:
+    """Validate the observed ``claude agents --json --all`` response schema."""
+    if not isinstance(payload, list):
+        raise TypeError("agents payload must be a top-level JSON array")
+    for index, agent in enumerate(payload):
+        if not isinstance(agent, Mapping):
+            raise TypeError(f"agents payload item {index} must be an object")
+        missing = REQUIRED_AGENT_OBJECT_KEYS - agent.keys()
+        if missing:
+            keys = ", ".join(sorted(missing))
+            raise ValueError(f"agents payload item {index} is missing keys: {keys}")
 
 
 def sha256_file(path: Path) -> str:

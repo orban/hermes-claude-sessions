@@ -14,6 +14,7 @@ from hermes_claude_sessions.characterization import (
     REQUIRED_FLAGS,
     atomic_write_contract,
     collect_live_contract,
+    validate_agents_json_payload,
     validate_prerequisites,
 )
 
@@ -50,8 +51,7 @@ def test_non_mutating_cli_contract(tmp_path: Path) -> None:
     assert agents_capture["timed_out"] is False
     assert agents_capture["error"] is None
     agents_payload = json.loads(agents_capture["stdout"])
-    assert isinstance(agents_payload, dict)
-    assert isinstance(agents_payload.get("agents"), list)
+    validate_agents_json_payload(agents_payload)
 
     serialized = (tmp_path / "contract.json").read_text()
     assert "/Users/ryo" not in serialized

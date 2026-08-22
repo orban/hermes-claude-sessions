@@ -12,6 +12,7 @@ import pytest
 
 from hermes_claude_sessions.characterization import (
     MAX_OUTPUT_BYTES,
+    REQUIRED_AGENT_OBJECT_KEYS,
     CharacterizationError,
     CommandCapture,
     _run_command,
@@ -22,6 +23,7 @@ from hermes_claude_sessions.characterization import (
     run_command,
     sanitize_contract,
     sanitize_text,
+    validate_agents_json_payload,
     validate_prerequisites,
 )
 
@@ -117,6 +119,21 @@ def test_run_command_allows_only_exact_safe_suffixes() -> None:
     capture = run_command([sys.executable, "--version"], timeout_seconds=1)
     assert capture.returncode == 0
     assert capture.argv == (sys.executable, "--version")
+
+
+def test_agents_json_payload_requires_a_list_of_identified_agent_objects() -> None:
+    assert frozenset(("id", "name", "state")) == REQUIRED_AGENT_OBJECT_KEYS
+    validate_agents_json_payload([])
+    validate_agents_json_payload(
+        [{"id": "agent-1", "name": "worker", "state": "running"}]
+    )
+
+    with pytest.raises(TypeError, match="top-level JSON array"):
+        validate_agents_json_payload({"agents": []})
+    with pytest.raises(TypeError, match="an object"):
+        validate_agents_json_payload(["agent-1"])
+    with pytest.raises(ValueError, match="name, state"):
+        validate_agents_json_payload([{"id": "agent-1"}])
 
 
 def test_sanitization_removes_user_home_temp_namespace_and_prompt() -> None:
