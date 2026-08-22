@@ -245,6 +245,29 @@ def test_extract_required_contract_finds_advertised_flags_and_commands() -> None
     ]
 
 
+def test_atomic_write_contract_redacts_colon_labeled_captures(tmp_path: Path) -> None:
+    destination = tmp_path / "contract.json"
+    contract = {
+        "capture": CommandCapture(
+            ("claude", "--help"),
+            0,
+            "PrOmPt: attack phrase\nsafe stdout line",
+            "nAmEsPaCe: tenant-xyz\nsafe stderr line",
+            False,
+            None,
+        )
+    }
+
+    atomic_write_contract(destination, contract)
+
+    serialized = destination.read_text()
+    written = json.loads(serialized)
+    assert "attack phrase" not in serialized
+    assert "tenant-xyz" not in serialized
+    assert written["capture"]["stdout"] == "PrOmPt: <REDACTED_PROMPT>\nsafe stdout line"
+    assert written["capture"]["stderr"] == "nAmEsPaCe: <NAMESPACE>\nsafe stderr line"
+
+
 def test_atomic_contract_output_is_sanitized_and_complete(tmp_path: Path) -> None:
     destination = tmp_path / "contract.json"
     contract = {

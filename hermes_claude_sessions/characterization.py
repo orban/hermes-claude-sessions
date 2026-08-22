@@ -213,8 +213,11 @@ def _sanitize_plain_text(
     for sensitive in sorted(set(sensitive_values), key=len, reverse=True):
         if sensitive:
             result = result.replace(sensitive, "<REDACTED>")
-    result = re.sub(r"(?im)(\bprompt\s*=\s*)[^\r\n]*", r"\1<REDACTED_PROMPT>", result)
+    result = re.sub(
+        r"(?im)(\bprompt\s*(?:=|:)\s*)[^\r\n]*", r"\1<REDACTED_PROMPT>", result
+    )
     result = re.sub(r"(?i)(\bnamespace\s*=\s*)[^\s,;]+", r"\1<NAMESPACE>", result)
+    result = re.sub(r"(?im)(\bnamespace\s*:\s*)[^\r\n]*", r"\1<NAMESPACE>", result)
     result = re.sub(r"\b(?:ns|namespace)[_-][A-Za-z0-9_-]{8,}\b", "<NAMESPACE>", result)
     return re.sub(r"\b[0-9a-f]{8}-[0-9a-f-]{27,}\b", "<NAMESPACE>", result, flags=re.I)
 
