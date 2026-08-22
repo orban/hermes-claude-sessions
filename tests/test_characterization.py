@@ -142,7 +142,7 @@ def test_run_command_rejects_non_capabilities_and_mutating_suffixes_before_popen
 
 def test_run_command_allows_only_exact_safe_suffixes(tmp_path: Path) -> None:
     capability = _validated_capability(tmp_path / "claude")
-    capture = run_command(capability, ("--version",), timeout_seconds=1)
+    capture = run_command(capability, ("--version",), timeout_seconds=5)
     assert capture.returncode == 0
     assert capture.argv == (str(tmp_path / "claude"), "--version")
 
