@@ -6,6 +6,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import pytest
@@ -98,6 +99,42 @@ def test_private_runner_captures_timeout_and_os_error() -> None:
     assert missing.returncode is None
     assert missing.error
     assert "definitely/not/a/command" in missing.error
+
+
+@pytest.mark.skipif(
+    os.name != "posix", reason="process-group containment is POSIX-specific"
+)
+def test_private_runner_timeout_terminates_descendant_holding_pipes(
+    tmp_path: Path,
+) -> None:
+    ready = tmp_path / "descendant-ready"
+    child_code = (
+        "import os, signal, sys, time; "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        "os.close(os.open(sys.argv[1], os.O_CREAT)); time.sleep(30)"
+    )
+    parent_code = (
+        "import os, subprocess, sys, time\n"
+        "ready = sys.argv[1]\n"
+        f"child = subprocess.Popen([sys.executable, '-c', {child_code!r}, ready], "
+        "stdout=sys.stdout, stderr=sys.stderr)\n"
+        "while not os.path.exists(ready):\n"
+        "    time.sleep(0.01)\n"
+        "print(child.pid, flush=True)\n"
+        "time.sleep(30)"
+    )
+    started = time.monotonic()
+    capture = _run_command(
+        [sys.executable, "-c", parent_code, str(ready)], timeout_seconds=0.5
+    )
+    elapsed = time.monotonic() - started
+
+    assert capture.timed_out is True
+    assert capture.returncode is None
+    assert elapsed < 1.0
+    descendant_pid = int(capture.stdout.strip())
+    with pytest.raises(ProcessLookupError):
+        os.kill(descendant_pid, 0)
 
 
 def test_private_runner_bounds_noisy_stdout_and_stderr_during_execution() -> None:

@@ -6,12 +6,14 @@ is limited to help, version, status, and agent-listing commands.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import getpass
 import hashlib
 import json
 import os
 import re
+import signal
 import subprocess
 import tempfile
 import threading
@@ -21,6 +23,8 @@ from typing import Any, BinaryIO, cast
 
 MAX_OUTPUT_BYTES = 32_768
 DEFAULT_TIMEOUT_SECONDS = 10.0
+TERMINATION_GRACE_SECONDS = 1.0
+DRAIN_JOIN_SECONDS = 0.2
 REQUIRED_FLAGS = (
     "--bg",
     "--session-id",
@@ -112,7 +116,39 @@ def _drain_stream(stream: BinaryIO, destination: bytearray, output_limit: int) -
             remaining = output_limit - len(destination)
             if remaining > 0:
                 destination.extend(chunk[:remaining])
+    except (OSError, ValueError):
+        # The timeout path may close a stream to unblock a lingering reader.
+        pass
     finally:
+        with contextlib.suppress(OSError, ValueError):
+            stream.close()
+
+
+def _terminate_process_tree(process: subprocess.Popen[bytes]) -> None:
+    """Terminate a private process group, falling back to the direct child."""
+    if os.name == "posix":
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+    else:
+        process.terminate()
+
+
+def _kill_process_tree(process: subprocess.Popen[bytes]) -> None:
+    """Force-kill a private process group, falling back to the direct child."""
+    if os.name == "posix":
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+    else:
+        process.kill()
+
+
+def _close_stream(stream: BinaryIO) -> None:
+    """Best-effort unblock of a drain thread after timeout containment."""
+    with contextlib.suppress(OSError, ValueError):
         stream.close()
 
 
@@ -132,6 +168,7 @@ def _run_command(
             shell=False,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            start_new_session=os.name == "posix",
         )
     except OSError as error:
         return CommandCapture(
@@ -155,16 +192,29 @@ def _run_command(
         returncode = process.wait(timeout=timeout_seconds)
     except subprocess.TimeoutExpired:
         timed_out = True
-        process.terminate()
+        _terminate_process_tree(process)
         try:
-            process.wait(timeout=1)
+            process.wait(timeout=TERMINATION_GRACE_SECONDS)
         except subprocess.TimeoutExpired:
-            process.kill()
+            _kill_process_tree(process)
             process.wait()
+        else:
+            # The direct child may exit on TERM while a descendant ignores it.
+            # Kill the private group anyway before returning to avoid leaving it alive.
+            if os.name == "posix":
+                _kill_process_tree(process)
         returncode = None
     finally:
-        stdout_thread.join()
-        stderr_thread.join()
+        if timed_out:
+            # A descendant that escaped containment may still hold these pipes.
+            # Never let its reader threads defeat the caller's timeout contract.
+            _close_stream(cast(BinaryIO, process.stdout))
+            _close_stream(cast(BinaryIO, process.stderr))
+            stdout_thread.join(timeout=DRAIN_JOIN_SECONDS)
+            stderr_thread.join(timeout=DRAIN_JOIN_SECONDS)
+        else:
+            stdout_thread.join()
+            stderr_thread.join()
 
     return CommandCapture(
         normalized_argv,
