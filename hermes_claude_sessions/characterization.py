@@ -14,9 +14,10 @@ import os
 import re
 import subprocess
 import tempfile
+import threading
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, BinaryIO, cast
 
 MAX_OUTPUT_BYTES = 32_768
 DEFAULT_TIMEOUT_SECONDS = 10.0
@@ -75,12 +76,80 @@ def validate_prerequisites(environment: Mapping[str, str]) -> Path:
     return binary
 
 
-def _bounded(value: str | bytes | None, output_limit: int) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, bytes):
-        value = value.decode("utf-8", errors="replace")
-    return value[:output_limit]
+def _decode_bounded(value: bytes) -> str:
+    """Decode stored bytes without allowing replacement characters to exceed the cap."""
+    return value.decode("utf-8", errors="ignore")
+
+
+def _drain_stream(stream: BinaryIO, destination: bytearray, output_limit: int) -> None:
+    """Continuously drain a pipe while retaining at most ``output_limit`` bytes."""
+    try:
+        while chunk := stream.read(8_192):
+            remaining = output_limit - len(destination)
+            if remaining > 0:
+                destination.extend(chunk[:remaining])
+    finally:
+        stream.close()
+
+
+def _run_command(
+    argv: Sequence[str],
+    *,
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+    output_limit: int = MAX_OUTPUT_BYTES,
+) -> CommandCapture:
+    """Run arbitrary argv privately with bounded concurrent pipe draining."""
+    if output_limit < 0:
+        raise ValueError("output_limit must not be negative")
+    normalized_argv = tuple(argv)
+    try:
+        process = subprocess.Popen(
+            normalized_argv,
+            shell=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except OSError as error:
+        return CommandCapture(
+            normalized_argv, None, "", "", False, f"{type(error).__name__}: {error}"
+        )
+
+    assert process.stdout is not None
+    assert process.stderr is not None
+    stdout = bytearray()
+    stderr = bytearray()
+    stdout_thread = threading.Thread(
+        target=_drain_stream, args=(process.stdout, stdout, output_limit), daemon=True
+    )
+    stderr_thread = threading.Thread(
+        target=_drain_stream, args=(process.stderr, stderr, output_limit), daemon=True
+    )
+    stdout_thread.start()
+    stderr_thread.start()
+    timed_out = False
+    try:
+        returncode = process.wait(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        process.terminate()
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+        returncode = None
+    finally:
+        stdout_thread.join()
+        stderr_thread.join()
+
+    return CommandCapture(
+        normalized_argv,
+        returncode,
+        _decode_bounded(bytes(stdout)),
+        _decode_bounded(bytes(stderr)),
+        timed_out,
+        None,
+    )
 
 
 def run_command(
@@ -89,37 +158,13 @@ def run_command(
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     output_limit: int = MAX_OUTPUT_BYTES,
 ) -> CommandCapture:
-    """Run a bounded command without a shell, retaining failures as data."""
+    """Run only an exact, allowlisted Claude command without a shell."""
     normalized_argv = tuple(argv)
-    try:
-        completed = subprocess.run(
-            normalized_argv,
-            check=False,
-            shell=False,
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds,
-        )
-    except subprocess.TimeoutExpired as error:
-        return CommandCapture(
-            normalized_argv,
-            None,
-            _bounded(error.stdout, output_limit),
-            _bounded(error.stderr, output_limit),
-            True,
-            None,
-        )
-    except OSError as error:
-        return CommandCapture(
-            normalized_argv, None, "", "", False, f"{type(error).__name__}: {error}"
-        )
-    return CommandCapture(
-        normalized_argv,
-        completed.returncode,
-        _bounded(completed.stdout, output_limit),
-        _bounded(completed.stderr, output_limit),
-        False,
-        None,
+    suffix = normalized_argv[1:]
+    if not normalized_argv or suffix not in SAFE_COMMANDS:
+        raise CharacterizationError("command suffix is not an allowlisted safe command")
+    return _run_command(
+        normalized_argv, timeout_seconds=timeout_seconds, output_limit=output_limit
     )
 
 
@@ -132,20 +177,21 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def sanitize_text(
+def _sanitize_plain_text(
     value: str,
     *,
-    username: str | None = None,
-    sensitive_values: Iterable[str] = (),
+    username: str | None,
+    sensitive_values: Iterable[str],
 ) -> str:
-    """Remove local identity, path, namespace, and caller-designated prompt data."""
     user = username if username is not None else getpass.getuser()
     result = value
     home = str(Path.home())
     if home:
         result = result.replace(home, "<HOME>")
     result = re.sub(
-        r"/var/folders/[^/\s]+/[^/\s]+/T(?:/[^\s]*)?", "<TEMP_PATH>", result
+        r"/(?:private/)?var/folders/[^/\s]+/[^/\s]+/T(?:/[^\s]*)?",
+        "<TEMP_PATH>",
+        result,
     )
     result = re.sub(r"/(?:tmp|private/tmp)(?:/[^\s]*)?", "<TEMP_PATH>", result)
     if user:
@@ -153,11 +199,66 @@ def sanitize_text(
     for sensitive in sorted(set(sensitive_values), key=len, reverse=True):
         if sensitive:
             result = result.replace(sensitive, "<REDACTED>")
+    result = re.sub(r"(?im)(\bprompt\s*=\s*)[^\r\n]*", r"\1<REDACTED_PROMPT>", result)
+    result = re.sub(r"(?i)(\bnamespace\s*=\s*)[^\s,;]+", r"\1<NAMESPACE>", result)
     result = re.sub(r"\b(?:ns|namespace)[_-][A-Za-z0-9_-]{8,}\b", "<NAMESPACE>", result)
-    result = re.sub(
-        r"\b[0-9a-f]{8}-[0-9a-f-]{27,}\b", "<NAMESPACE>", result, flags=re.I
-    )
-    return result
+    return re.sub(r"\b[0-9a-f]{8}-[0-9a-f-]{27,}\b", "<NAMESPACE>", result, flags=re.I)
+
+
+def _sanitize_value(
+    value: Any,
+    *,
+    username: str | None,
+    sensitive_values: Iterable[str],
+    field_name: str = "",
+) -> Any:
+    normalized_field = field_name.lower()
+    if "prompt" in normalized_field:
+        return "<REDACTED_PROMPT>"
+    if "namespace" in normalized_field:
+        return "<NAMESPACE>"
+    if isinstance(value, str):
+        return sanitize_text(
+            value, username=username, sensitive_values=sensitive_values
+        )
+    if isinstance(value, Mapping):
+        return {
+            str(key): _sanitize_value(
+                item,
+                username=username,
+                sensitive_values=sensitive_values,
+                field_name=str(key),
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [
+            _sanitize_value(item, username=username, sensitive_values=sensitive_values)
+            for item in value
+        ]
+    return value
+
+
+def sanitize_text(
+    value: str,
+    *,
+    username: str | None = None,
+    sensitive_values: Iterable[str] = (),
+) -> str:
+    """Remove sensitive identity and arbitrary prompt/namespace data from text."""
+    sensitive = tuple(sensitive_values)
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return _sanitize_plain_text(
+            value, username=username, sensitive_values=sensitive
+        )
+    if isinstance(parsed, Mapping | list):
+        sanitized = _sanitize_value(
+            parsed, username=username, sensitive_values=sensitive
+        )
+        return json.dumps(sanitized, ensure_ascii=True, sort_keys=True)
+    return _sanitize_plain_text(value, username=username, sensitive_values=sensitive)
 
 
 def _jsonable(value: Any) -> Any:
@@ -180,29 +281,17 @@ def sanitize_contract(
 ) -> dict[str, Any]:
     """Make a JSON-compatible contract safe to persist as a shared fixture."""
 
-    def sanitize(value: Any, *, field_name: str = "") -> Any:
-        normalized_field = field_name.lower()
-        if "prompt" in normalized_field:
-            return "<REDACTED_PROMPT>"
-        if "namespace" in normalized_field:
-            return "<NAMESPACE>"
-        if isinstance(value, str):
-            return sanitize_text(
-                value, username=username, sensitive_values=sensitive_values
-            )
-        if isinstance(value, Mapping):
-            return {
-                str(key): sanitize(item, field_name=str(key))
-                for key, item in value.items()
-            }
-        if isinstance(value, list):
-            return [sanitize(item) for item in value]
-        return value
-
     converted = _jsonable(contract)
     if not isinstance(converted, dict):  # pragma: no cover - defensive public boundary
         raise TypeError("contract must serialize to a mapping")
-    return cast(dict[str, Any], sanitize(converted))
+    return cast(
+        dict[str, Any],
+        _sanitize_value(
+            converted,
+            username=username,
+            sensitive_values=tuple(sensitive_values),
+        ),
+    )
 
 
 def extract_required_contract(help_text: str) -> dict[str, list[str]]:

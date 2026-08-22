@@ -1,16 +1,22 @@
 from __future__ import annotations
 
 import json
+import os
 import stat
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
 
 from hermes_claude_sessions.characterization import (
+    MAX_OUTPUT_BYTES,
     CharacterizationError,
     CommandCapture,
+    _run_command,
     atomic_write_contract,
+    collect_live_contract,
     contract_fingerprint,
     extract_required_contract,
     run_command,
@@ -53,39 +59,70 @@ def test_prerequisites_reject_relative_or_nonexecutable_binary(tmp_path: Path) -
         validate_prerequisites(env)
 
 
-def test_run_command_captures_timeout_and_os_error() -> None:
-    timed_out = run_command(
+def test_private_runner_captures_timeout_and_os_error() -> None:
+    timed_out = _run_command(
         [
             sys.executable,
             "-c",
-            "import time; print('begin', flush=True); time.sleep(2)",
+            "import os, time; print(os.getpid(), flush=True); time.sleep(2)",
         ],
         timeout_seconds=0.2,
     )
     assert timed_out.timed_out is True
     assert timed_out.returncode is None
-    assert "begin" in timed_out.stdout
+    child_pid = int(timed_out.stdout.strip())
+    with pytest.raises(ProcessLookupError):
+        os.kill(child_pid, 0)
 
-    missing = run_command(["/definitely/not/a/command"], timeout_seconds=1)
+    missing = _run_command(["/definitely/not/a/command"], timeout_seconds=1)
     assert missing.returncode is None
     assert missing.error
     assert "definitely/not/a/command" in missing.error
 
 
-def test_run_command_binds_output_and_uses_argv() -> None:
-    capture = run_command(
-        [sys.executable, "-c", "print('x' * 500)"],
-        timeout_seconds=1,
-        output_limit=20,
+def test_private_runner_bounds_noisy_stdout_and_stderr_during_execution() -> None:
+    capture = _run_command(
+        [
+            sys.executable,
+            "-c",
+            "import sys; "
+            "[print('o' * 8192) for _ in range(1024)]; "
+            "[print('e' * 8192, file=sys.stderr) for _ in range(1024)]",
+        ],
+        timeout_seconds=10,
     )
     assert capture.returncode == 0
-    assert len(capture.stdout) <= 20
-    assert capture.argv[0] == sys.executable
+    assert len(capture.stdout.encode("utf-8")) <= MAX_OUTPUT_BYTES
+    assert len(capture.stderr.encode("utf-8")) <= MAX_OUTPUT_BYTES
+
+
+def test_run_command_rejects_mutating_suffixes_before_subprocess_creation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_if_started(*args: object, **kwargs: object) -> None:
+        raise AssertionError("subprocess creation must not be reached")
+
+    monkeypatch.setattr(subprocess, "Popen", fail_if_started)
+    for suffix in (
+        ("stop", "session"),
+        ("respawn", "session"),
+        ("rm", "session"),
+        ("launch",),
+    ):
+        with pytest.raises(CharacterizationError, match="not an allowlisted"):
+            run_command([sys.executable, *suffix])
+
+
+def test_run_command_allows_only_exact_safe_suffixes() -> None:
+    capture = run_command([sys.executable, "--version"], timeout_seconds=1)
+    assert capture.returncode == 0
+    assert capture.argv == (sys.executable, "--version")
 
 
 def test_sanitization_removes_user_home_temp_namespace_and_prompt() -> None:
     raw = (
         "ryo at /Users/ryo/workspace and /var/folders/ab/cd/T/job-123; "
+        "/private/var/folders/ab/cd/T/job-456; "
         "namespace=ns_01JABCDEF1234567890ABCDEF; prompt=secret prompt"
     )
     clean = sanitize_text(raw, username="ryo", sensitive_values=["secret prompt"])
@@ -95,12 +132,72 @@ def test_sanitization_removes_user_home_temp_namespace_and_prompt() -> None:
     assert "ryo" not in clean
     assert "/Users/ryo" not in clean
     assert "/var/folders/ab/cd/T/job-123" not in clean
+    assert "/private/var/folders/ab/cd/T/job-456" not in clean
     assert "secret prompt" not in clean
     assert "<HOME>" in clean
     assert "<TEMP_PATH>" in clean
     assert "<NAMESPACE>" in clean
     assert contract["prompt"] == "<REDACTED_PROMPT>"
     assert contract["namespace"] == "<NAMESPACE>"
+    current_temp = f"{tempfile.gettempdir()}/characterization-output"
+    assert current_temp not in sanitize_text(current_temp, username="not-present")
+
+
+def test_sanitize_text_redacts_arbitrary_prompt_and_namespace_from_json_and_text() -> (
+    None
+):
+    json_capture = json.dumps(
+        {"agents": [{"prompt": "arbitrary secret", "namespace": "tenant-blue"}]}
+    )
+    clean_json = sanitize_text(json_capture, username="not-present")
+    clean_text = sanitize_text(
+        "prompt=arbitrary secret with spaces\nnamespace=tenant-blue",
+        username="not-present",
+    )
+    assert "arbitrary secret" not in clean_json
+    assert "tenant-blue" not in clean_json
+    assert json.loads(clean_json) == {
+        "agents": [{"namespace": "<NAMESPACE>", "prompt": "<REDACTED_PROMPT>"}]
+    }
+    assert "arbitrary secret" not in clean_text
+    assert "tenant-blue" not in clean_text
+    assert "<REDACTED_PROMPT>" in clean_text
+    assert "<NAMESPACE>" in clean_text
+
+
+def test_collect_live_contract_sanitizes_every_capture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    binary = tmp_path / "claude"
+    binary.write_text("binary")
+
+    def fake_run(argv: list[str]) -> CommandCapture:
+        return CommandCapture(
+            tuple(argv),
+            0,
+            json.dumps(
+                {"agents": [{"prompt": "raw prompt", "namespace": "tenant-red"}]}
+            ),
+            "prompt=another raw prompt\nnamespace=tenant-green",
+            False,
+            None,
+        )
+
+    monkeypatch.setattr("hermes_claude_sessions.characterization.run_command", fake_run)
+    contract = collect_live_contract(binary)
+    serialized = json.dumps(contract)
+    assert "raw prompt" not in serialized
+    assert "tenant-red" not in serialized
+    assert "tenant-green" not in serialized
+
+
+def test_sanitize_text_handles_empty_user_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "hermes_claude_sessions.characterization.getpass.getuser", lambda: ""
+    )
+    assert sanitize_text("safe output") == "safe output"
 
 
 def test_fingerprint_is_deterministic_and_ignores_key_order() -> None:
