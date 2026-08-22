@@ -17,6 +17,7 @@ import signal
 import subprocess
 import tempfile
 import threading
+import time
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, BinaryIO, cast
@@ -180,41 +181,58 @@ def _run_command(
     stdout = bytearray()
     stderr = bytearray()
     stdout_thread = threading.Thread(
-        target=_drain_stream, args=(process.stdout, stdout, output_limit), daemon=True
+        target=_drain_stream,
+        args=(process.stdout, stdout, output_limit),
+        daemon=True,
+        name="command-stdout-drain",
     )
     stderr_thread = threading.Thread(
-        target=_drain_stream, args=(process.stderr, stderr, output_limit), daemon=True
+        target=_drain_stream,
+        args=(process.stderr, stderr, output_limit),
+        daemon=True,
+        name="command-stderr-drain",
     )
     stdout_thread.start()
     stderr_thread.start()
+    deadline = time.monotonic() + timeout_seconds
+
+    def join_drain_threads_until(join_deadline: float) -> None:
+        stdout_thread.join(timeout=max(0.0, join_deadline - time.monotonic()))
+        stderr_thread.join(timeout=max(0.0, join_deadline - time.monotonic()))
+
     timed_out = False
+    direct_child_reaped = False
     try:
-        returncode = process.wait(timeout=timeout_seconds)
+        returncode = process.wait(timeout=max(0.0, deadline - time.monotonic()))
+        direct_child_reaped = True
+        join_drain_threads_until(deadline)
+        if stdout_thread.is_alive() or stderr_thread.is_alive():
+            timed_out = True
     except subprocess.TimeoutExpired:
         timed_out = True
-        _terminate_process_tree(process)
-        try:
-            process.wait(timeout=TERMINATION_GRACE_SECONDS)
-        except subprocess.TimeoutExpired:
-            _kill_process_tree(process)
-            process.wait()
-        else:
-            # The direct child may exit on TERM while a descendant ignores it.
-            # Kill the private group anyway before returning to avoid leaving it alive.
-            if os.name == "posix":
-                _kill_process_tree(process)
         returncode = None
-    finally:
-        if timed_out:
-            # A descendant that escaped containment may still hold these pipes.
-            # Never let its reader threads defeat the caller's timeout contract.
-            _close_stream(cast(BinaryIO, process.stdout))
-            _close_stream(cast(BinaryIO, process.stderr))
-            stdout_thread.join(timeout=DRAIN_JOIN_SECONDS)
-            stderr_thread.join(timeout=DRAIN_JOIN_SECONDS)
-        else:
-            stdout_thread.join()
-            stderr_thread.join()
+
+    if timed_out:
+        _terminate_process_tree(process)
+        if not direct_child_reaped:
+            try:
+                process.wait(timeout=TERMINATION_GRACE_SECONDS)
+                direct_child_reaped = True
+            except subprocess.TimeoutExpired:
+                _kill_process_tree(process)
+                process.wait(timeout=TERMINATION_GRACE_SECONDS)
+                direct_child_reaped = True
+        elif os.name == "posix":
+            # Give descendants a bounded chance to honor TERM before forcing EOF.
+            join_drain_threads_until(time.monotonic() + DRAIN_JOIN_SECONDS)
+
+        # The direct child may exit on TERM while a descendant ignores it.  On
+        # POSIX its private group survives the leader, so always kill that group.
+        if os.name == "posix":
+            _kill_process_tree(process)
+        _close_stream(cast(BinaryIO, process.stdout))
+        _close_stream(cast(BinaryIO, process.stderr))
+        join_drain_threads_until(time.monotonic() + DRAIN_JOIN_SECONDS)
 
     return CommandCapture(
         normalized_argv,

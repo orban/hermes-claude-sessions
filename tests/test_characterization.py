@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import os
+import signal
 import stat
 import subprocess
 import sys
@@ -135,6 +137,54 @@ def test_private_runner_timeout_terminates_descendant_holding_pipes(
     descendant_pid = int(capture.stdout.strip())
     with pytest.raises(ProcessLookupError):
         os.kill(descendant_pid, 0)
+
+
+@pytest.mark.skipif(
+    os.name != "posix", reason="process-group containment is POSIX-specific"
+)
+def test_private_runner_deadline_includes_inherited_pipe_eof(tmp_path: Path) -> None:
+    ready = tmp_path / "descendant-ready"
+    pid_file = tmp_path / "descendant-pid"
+    descendant_code = (
+        "import os, signal, sys, time; "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        "open(sys.argv[1], 'w').write(str(os.getpid())); "
+        "open(sys.argv[2], 'w').close(); time.sleep(30)"
+    )
+    parent_code = (
+        "import subprocess, sys\n"
+        f"subprocess.Popen([sys.executable, '-c', {descendant_code!r}, "
+        "sys.argv[1], sys.argv[2]], stdout=sys.stdout, stderr=sys.stderr)\n"
+    )
+    worker_code = (
+        "import json, sys, threading\n"
+        "from hermes_claude_sessions.characterization import _run_command\n"
+        f"capture = _run_command([sys.executable, '-c', {parent_code!r}, "
+        "sys.argv[1], sys.argv[2]], timeout_seconds=0.3)\n"
+        "print(json.dumps({'timed_out': capture.timed_out, "
+        "'returncode': capture.returncode, "
+        "'drain_threads': sum(thread.name.startswith('command-') "
+        "for thread in threading.enumerate())}))\n"
+    )
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-c", worker_code, str(pid_file), str(ready)],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        assert completed.returncode == 0, completed.stderr
+        result = json.loads(completed.stdout)
+        assert result == {"timed_out": True, "returncode": 0, "drain_threads": 0}
+        assert ready.exists()
+        descendant_pid = int(pid_file.read_text())
+        with pytest.raises(ProcessLookupError):
+            os.kill(descendant_pid, 0)
+    finally:
+        if pid_file.exists():
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(int(pid_file.read_text()), signal.SIGKILL)
 
 
 def test_private_runner_bounds_noisy_stdout_and_stderr_during_execution() -> None:
