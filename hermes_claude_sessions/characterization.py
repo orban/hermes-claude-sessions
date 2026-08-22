@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import re
+import selectors
 import signal
 import subprocess
 import tempfile
@@ -25,7 +26,6 @@ from typing import Any, BinaryIO, cast
 MAX_OUTPUT_BYTES = 32_768
 DEFAULT_TIMEOUT_SECONDS = 10.0
 TERMINATION_GRACE_SECONDS = 1.0
-DRAIN_JOIN_SECONDS = 0.2
 REQUIRED_FLAGS = (
     "--bg",
     "--session-id",
@@ -110,15 +110,33 @@ def _decode_bounded(value: bytes) -> str:
     return value.decode("utf-8", errors="ignore")
 
 
+def _retain_chunk(destination: bytearray, chunk: bytes, output_limit: int) -> None:
+    """Retain a bounded prefix while callers continue draining the whole pipe."""
+    remaining = output_limit - len(destination)
+    if remaining > 0:
+        destination.extend(chunk[:remaining])
+
+
+def _drain_nonblocking(fd: int, destination: bytearray, output_limit: int) -> bool:
+    """Drain all currently available bytes and report whether the pipe reached EOF."""
+    while True:
+        try:
+            chunk = os.read(fd, 8_192)
+        except BlockingIOError:
+            return False
+        except OSError:
+            return True
+        if not chunk:
+            return True
+        _retain_chunk(destination, chunk, output_limit)
+
+
 def _drain_stream(stream: BinaryIO, destination: bytearray, output_limit: int) -> None:
-    """Continuously drain a pipe while retaining at most ``output_limit`` bytes."""
+    """Windows fallback drain: daemonized and never joined without a deadline."""
     try:
         while chunk := stream.read(8_192):
-            remaining = output_limit - len(destination)
-            if remaining > 0:
-                destination.extend(chunk[:remaining])
+            _retain_chunk(destination, chunk, output_limit)
     except (OSError, ValueError):
-        # The timeout path may close a stream to unblock a lingering reader.
         pass
     finally:
         with contextlib.suppress(OSError, ValueError):
@@ -128,29 +146,98 @@ def _drain_stream(stream: BinaryIO, destination: bytearray, output_limit: int) -
 def _terminate_process_tree(process: subprocess.Popen[bytes]) -> None:
     """Terminate a private process group, falling back to the direct child."""
     if os.name == "posix":
-        try:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
             os.killpg(process.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            return
     else:
-        process.terminate()
+        with contextlib.suppress(OSError):
+            process.terminate()
 
 
 def _kill_process_tree(process: subprocess.Popen[bytes]) -> None:
     """Force-kill a private process group, falling back to the direct child."""
     if os.name == "posix":
-        try:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
             os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            return
     else:
-        process.kill()
+        with contextlib.suppress(OSError):
+            process.kill()
 
 
 def _close_stream(stream: BinaryIO) -> None:
-    """Best-effort unblock of a drain thread after timeout containment."""
     with contextlib.suppress(OSError, ValueError):
         stream.close()
+
+
+def _capture_posix_until_deadline(
+    process: subprocess.Popen[bytes],
+    stdout: bytearray,
+    stderr: bytearray,
+    output_limit: int,
+    deadline: float,
+) -> tuple[int | None, bool, bool]:
+    """Poll a direct child and both pipes under one deadline without reader threads."""
+    assert process.stdout is not None
+    assert process.stderr is not None
+    streams = ((process.stdout, stdout), (process.stderr, stderr))
+    selector = selectors.DefaultSelector()
+    direct_child_reaped = False
+    returncode: int | None = None
+    try:
+        for stream, destination in streams:
+            os.set_blocking(stream.fileno(), False)
+            selector.register(stream, selectors.EVENT_READ, destination)
+        while True:
+            polled = process.poll()
+            if polled is not None:
+                returncode = polled
+                direct_child_reaped = True
+            if direct_child_reaped and not selector.get_map():
+                return returncode, True, False
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return returncode, direct_child_reaped, True
+            for key, _ in selector.select(remaining):
+                destination = cast(bytearray, key.data)
+                if _drain_nonblocking(key.fd, destination, output_limit):
+                    selector.unregister(key.fileobj)
+                    _close_stream(cast(BinaryIO, key.fileobj))
+    finally:
+        selector.close()
+        for stream, _ in streams:
+            _close_stream(cast(BinaryIO, stream))
+
+
+def _capture_windows_until_deadline(
+    process: subprocess.Popen[bytes],
+    stdout: bytearray,
+    stderr: bytearray,
+    output_limit: int,
+    deadline: float,
+) -> tuple[int | None, bool, bool]:
+    """Bounded fallback where Windows selectors cannot wait on anonymous pipes."""
+    assert process.stdout is not None
+    assert process.stderr is not None
+    threads = tuple(
+        threading.Thread(
+            target=_drain_stream,
+            args=(stream, destination, output_limit),
+            daemon=True,
+            name=f"command-{name}-drain",
+        )
+        for name, stream, destination in (
+            ("stdout", process.stdout, stdout),
+            ("stderr", process.stderr, stderr),
+        )
+    )
+    for thread in threads:
+        thread.start()
+    try:
+        returncode = process.wait(timeout=max(0.0, deadline - time.monotonic()))
+        for thread in threads:
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        return returncode, True, any(thread.is_alive() for thread in threads)
+    except subprocess.TimeoutExpired:
+        return None, False, True
 
 
 def _run_command(
@@ -159,7 +246,7 @@ def _run_command(
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     output_limit: int = MAX_OUTPUT_BYTES,
 ) -> CommandCapture:
-    """Run arbitrary argv privately with bounded concurrent pipe draining."""
+    """Run argv privately with a deadline covering the child and both pipe EOFs."""
     if output_limit < 0:
         raise ValueError("output_limit must not be negative")
     normalized_argv = tuple(argv)
@@ -176,41 +263,17 @@ def _run_command(
             normalized_argv, None, "", "", False, f"{type(error).__name__}: {error}"
         )
 
-    assert process.stdout is not None
-    assert process.stderr is not None
     stdout = bytearray()
     stderr = bytearray()
-    stdout_thread = threading.Thread(
-        target=_drain_stream,
-        args=(process.stdout, stdout, output_limit),
-        daemon=True,
-        name="command-stdout-drain",
-    )
-    stderr_thread = threading.Thread(
-        target=_drain_stream,
-        args=(process.stderr, stderr, output_limit),
-        daemon=True,
-        name="command-stderr-drain",
-    )
-    stdout_thread.start()
-    stderr_thread.start()
     deadline = time.monotonic() + timeout_seconds
-
-    def join_drain_threads_until(join_deadline: float) -> None:
-        stdout_thread.join(timeout=max(0.0, join_deadline - time.monotonic()))
-        stderr_thread.join(timeout=max(0.0, join_deadline - time.monotonic()))
-
-    timed_out = False
-    direct_child_reaped = False
-    try:
-        returncode = process.wait(timeout=max(0.0, deadline - time.monotonic()))
-        direct_child_reaped = True
-        join_drain_threads_until(deadline)
-        if stdout_thread.is_alive() or stderr_thread.is_alive():
-            timed_out = True
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        returncode = None
+    if os.name == "posix":
+        returncode, direct_child_reaped, timed_out = _capture_posix_until_deadline(
+            process, stdout, stderr, output_limit, deadline
+        )
+    else:
+        returncode, direct_child_reaped, timed_out = _capture_windows_until_deadline(
+            process, stdout, stderr, output_limit, deadline
+        )
 
     if timed_out:
         _terminate_process_tree(process)
@@ -222,17 +285,15 @@ def _run_command(
                 _kill_process_tree(process)
                 process.wait(timeout=TERMINATION_GRACE_SECONDS)
                 direct_child_reaped = True
-        elif os.name == "posix":
-            # Give descendants a bounded chance to honor TERM before forcing EOF.
-            join_drain_threads_until(time.monotonic() + DRAIN_JOIN_SECONDS)
-
-        # The direct child may exit on TERM while a descendant ignores it.  On
-        # POSIX its private group survives the leader, so always kill that group.
+        # The direct child can exit while a contained descendant holds a pipe.
+        # Always force the original POSIX group after the bounded TERM chance.
         if os.name == "posix":
             _kill_process_tree(process)
-        _close_stream(cast(BinaryIO, process.stdout))
-        _close_stream(cast(BinaryIO, process.stderr))
-        join_drain_threads_until(time.monotonic() + DRAIN_JOIN_SECONDS)
+        if os.name != "posix":
+            assert process.stdout is not None
+            assert process.stderr is not None
+            _close_stream(cast(BinaryIO, process.stdout))
+            _close_stream(cast(BinaryIO, process.stderr))
 
     return CommandCapture(
         normalized_argv,

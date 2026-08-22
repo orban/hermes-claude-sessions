@@ -135,8 +135,15 @@ def test_private_runner_timeout_terminates_descendant_holding_pipes(
     assert capture.returncode is None
     assert elapsed < 1.0
     descendant_pid = int(capture.stdout.strip())
-    with pytest.raises(ProcessLookupError):
-        os.kill(descendant_pid, 0)
+    cleanup_deadline = time.monotonic() + 1
+    while time.monotonic() < cleanup_deadline:
+        try:
+            os.kill(descendant_pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.01)
+    else:
+        pytest.fail("contained descendant was not cleaned up")
 
 
 @pytest.mark.skipif(
@@ -185,6 +192,77 @@ def test_private_runner_deadline_includes_inherited_pipe_eof(tmp_path: Path) -> 
         if pid_file.exists():
             with contextlib.suppress(ProcessLookupError):
                 os.kill(int(pid_file.read_text()), signal.SIGKILL)
+
+
+@pytest.mark.skipif(
+    os.name != "posix", reason="escaped-session containment is POSIX-specific"
+)
+def test_private_runner_deadline_survives_escaped_pipe_holder(tmp_path: Path) -> None:
+    pid_file = tmp_path / "escaped-pid"
+    ready = tmp_path / "escaped-ready"
+    result_file = tmp_path / "runner-result.json"
+    descendant_code = (
+        "import os, signal, sys, time; "
+        "os.setsid(); signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        "open(sys.argv[1], 'w').write(str(os.getpid())); "
+        "open(sys.argv[2], 'w').close(); time.sleep(30)"
+    )
+    parent_code = (
+        "import subprocess, sys\n"
+        f"subprocess.Popen([sys.executable, '-c', {descendant_code!r}, "
+        "sys.argv[1], sys.argv[2]], stdout=sys.stdout, stderr=sys.stderr)\n"
+    )
+    worker_code = (
+        "import json, sys, threading\n"
+        "from hermes_claude_sessions.characterization import _run_command\n"
+        f"capture = _run_command([sys.executable, '-c', {parent_code!r}, "
+        "sys.argv[1], sys.argv[2]], timeout_seconds=0.3)\n"
+        "open(sys.argv[3], 'w').write(json.dumps({"
+        "'timed_out': capture.timed_out, 'returncode': capture.returncode, "
+        "'drain_threads': sum(thread.name.startswith('command-') "
+        "for thread in threading.enumerate())}))\n"
+    )
+    worker = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            worker_code,
+            str(pid_file),
+            str(ready),
+            str(result_file),
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        deadline = time.monotonic() + 2
+        while worker.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert worker.poll() == 0, "runner exceeded strict outer deadline"
+        assert ready.exists()
+        assert json.loads(result_file.read_text()) == {
+            "timed_out": True,
+            "returncode": 0,
+            "drain_threads": 0,
+        }
+    finally:
+        if worker.poll() is None:
+            worker.kill()
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            worker.wait(timeout=1)
+        if pid_file.exists():
+            escaped_pid = int(pid_file.read_text())
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(escaped_pid, signal.SIGKILL)
+            cleanup_deadline = time.monotonic() + 1
+            while time.monotonic() < cleanup_deadline:
+                try:
+                    os.kill(escaped_pid, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.01)
+            else:
+                pytest.fail("test-owned escaped descendant was not cleaned up")
 
 
 def test_private_runner_bounds_noisy_stdout_and_stderr_during_execution() -> None:
