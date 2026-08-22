@@ -12,6 +12,7 @@ import pytest
 from hermes_claude_sessions.characterization import (
     REQUIRED_COMMANDS,
     REQUIRED_FLAGS,
+    AcknowledgedClaudeBinary,
     atomic_write_contract,
     collect_live_contract,
     validate_agents_json_payload,
@@ -19,7 +20,7 @@ from hermes_claude_sessions.characterization import (
 )
 
 
-def _live_binary_or_skip() -> Path:
+def _live_binary_or_skip() -> AcknowledgedClaudeBinary:
     try:
         return validate_prerequisites(os.environ)
     except Exception as error:

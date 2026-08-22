@@ -50,6 +50,29 @@ class CharacterizationError(ValueError):
     """Raised when an explicit opt-in safety prerequisite is not met."""
 
 
+_CAPABILITY_TOKEN = object()
+
+
+@dataclasses.dataclass(frozen=True, init=False)
+class AcknowledgedClaudeBinary:
+    """Unforgeable-within-the-public-API proof of an acknowledged Claude binary."""
+
+    _binary: Path
+
+    def __init__(self, binary: Path, token: object) -> None:
+        if token is not _CAPABILITY_TOKEN:
+            raise TypeError(
+                "acknowledged Claude binaries are issued by validation only"
+            )
+        object.__setattr__(self, "_binary", binary)
+
+
+def _require_acknowledged_binary(capability: object) -> Path:
+    if not isinstance(capability, AcknowledgedClaudeBinary):
+        raise CharacterizationError("a validated Claude capability is required")
+    return capability._binary
+
+
 @dataclasses.dataclass(frozen=True)
 class CommandCapture:
     """Bounded result of one argv-only subprocess execution."""
@@ -62,8 +85,8 @@ class CommandCapture:
     error: str | None
 
 
-def validate_prerequisites(environment: Mapping[str, str]) -> Path:
-    """Validate both acknowledgements and an absolute executable Claude binary."""
+def validate_prerequisites(environment: Mapping[str, str]) -> AcknowledgedClaudeBinary:
+    """Issue a capability for an acknowledged absolute executable Claude binary."""
     if environment.get("RUN_CLAUDE_CHARACTERIZATION") != "1":
         raise CharacterizationError("RUN_CLAUDE_CHARACTERIZATION=1 is required")
     if environment.get("CLAUDE_CHARACTERIZATION_ACK_COST") != "1":
@@ -74,7 +97,7 @@ def validate_prerequisites(environment: Mapping[str, str]) -> Path:
         raise CharacterizationError("CLAUDE_BIN must be an absolute path")
     if not binary.is_file() or not os.access(binary, os.X_OK):
         raise CharacterizationError("CLAUDE_BIN must point to an executable file")
-    return binary
+    return AcknowledgedClaudeBinary(binary, _CAPABILITY_TOKEN)
 
 
 def _decode_bounded(value: bytes) -> str:
@@ -154,18 +177,21 @@ def _run_command(
 
 
 def run_command(
-    argv: Sequence[str],
+    capability: AcknowledgedClaudeBinary,
+    suffix: Sequence[str],
     *,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     output_limit: int = MAX_OUTPUT_BYTES,
 ) -> CommandCapture:
-    """Run only an exact, allowlisted Claude command without a shell."""
-    normalized_argv = tuple(argv)
-    suffix = normalized_argv[1:]
-    if not normalized_argv or suffix not in SAFE_COMMANDS:
+    """Run an exact allowlisted command through an acknowledged Claude capability."""
+    binary = _require_acknowledged_binary(capability)
+    normalized_suffix = tuple(suffix)
+    if normalized_suffix not in SAFE_COMMANDS:
         raise CharacterizationError("command suffix is not an allowlisted safe command")
     return _run_command(
-        normalized_argv, timeout_seconds=timeout_seconds, output_limit=output_limit
+        (str(binary), *normalized_suffix),
+        timeout_seconds=timeout_seconds,
+        output_limit=output_limit,
     )
 
 
@@ -356,9 +382,10 @@ def atomic_write_contract(destination: Path, contract: Mapping[str, Any]) -> Non
     os.replace(temporary_name, destination)
 
 
-def collect_live_contract(binary: Path) -> dict[str, Any]:
+def collect_live_contract(capability: AcknowledgedClaudeBinary) -> dict[str, Any]:
     """Collect the strictly enumerated non-mutating CLI contract surface."""
-    captures = [run_command([str(binary), *suffix]) for suffix in SAFE_COMMANDS]
+    binary = _require_acknowledged_binary(capability)
+    captures = [run_command(capability, suffix) for suffix in SAFE_COMMANDS]
     combined_help = "\n".join(
         f"{capture.stdout}\n{capture.stderr}"
         for suffix, capture in zip(SAFE_COMMANDS, captures, strict=True)

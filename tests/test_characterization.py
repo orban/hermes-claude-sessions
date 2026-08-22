@@ -13,6 +13,7 @@ import pytest
 from hermes_claude_sessions.characterization import (
     MAX_OUTPUT_BYTES,
     REQUIRED_AGENT_OBJECT_KEYS,
+    AcknowledgedClaudeBinary,
     CharacterizationError,
     CommandCapture,
     _run_command,
@@ -26,6 +27,18 @@ from hermes_claude_sessions.characterization import (
     validate_agents_json_payload,
     validate_prerequisites,
 )
+
+
+def _validated_capability(binary: Path) -> AcknowledgedClaudeBinary:
+    binary.write_text("#!/bin/sh\nexit 0\n")
+    binary.chmod(binary.stat().st_mode | stat.S_IXUSR)
+    return validate_prerequisites(
+        {
+            "RUN_CLAUDE_CHARACTERIZATION": "1",
+            "CLAUDE_CHARACTERIZATION_ACK_COST": "1",
+            "CLAUDE_BIN": str(binary),
+        }
+    )
 
 
 def test_prerequisites_require_two_explicit_acknowledgements(tmp_path: Path) -> None:
@@ -43,6 +56,11 @@ def test_prerequisites_require_two_explicit_acknowledgements(tmp_path: Path) -> 
                 "CLAUDE_BIN": str(binary),
             }
         )
+
+    capability = _validated_capability(binary)
+    assert isinstance(capability, AcknowledgedClaudeBinary)
+    with pytest.raises(TypeError, match="issued by validation only"):
+        AcknowledgedClaudeBinary(binary, object())
 
 
 def test_prerequisites_reject_relative_or_nonexecutable_binary(tmp_path: Path) -> None:
@@ -98,13 +116,20 @@ def test_private_runner_bounds_noisy_stdout_and_stderr_during_execution() -> Non
     assert len(capture.stderr.encode("utf-8")) <= MAX_OUTPUT_BYTES
 
 
-def test_run_command_rejects_mutating_suffixes_before_subprocess_creation(
-    monkeypatch: pytest.MonkeyPatch,
+def test_run_command_rejects_non_capabilities_and_mutating_suffixes_before_popen(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     def fail_if_started(*args: object, **kwargs: object) -> None:
         raise AssertionError("subprocess creation must not be reached")
 
     monkeypatch.setattr(subprocess, "Popen", fail_if_started)
+    for binary in (str(tmp_path / "claude"), tmp_path / "claude"):
+        with pytest.raises(CharacterizationError, match="validated Claude capability"):
+            run_command(binary, ("--version",))
+        with pytest.raises(CharacterizationError, match="validated Claude capability"):
+            collect_live_contract(binary)
+
+    capability = _validated_capability(tmp_path / "claude")
     for suffix in (
         ("stop", "session"),
         ("respawn", "session"),
@@ -112,13 +137,14 @@ def test_run_command_rejects_mutating_suffixes_before_subprocess_creation(
         ("launch",),
     ):
         with pytest.raises(CharacterizationError, match="not an allowlisted"):
-            run_command([sys.executable, *suffix])
+            run_command(capability, suffix)
 
 
-def test_run_command_allows_only_exact_safe_suffixes() -> None:
-    capture = run_command([sys.executable, "--version"], timeout_seconds=1)
+def test_run_command_allows_only_exact_safe_suffixes(tmp_path: Path) -> None:
+    capability = _validated_capability(tmp_path / "claude")
+    capture = run_command(capability, ("--version",), timeout_seconds=1)
     assert capture.returncode == 0
-    assert capture.argv == (sys.executable, "--version")
+    assert capture.argv == (str(tmp_path / "claude"), "--version")
 
 
 def test_agents_json_payload_requires_a_list_of_identified_agent_objects() -> None:
@@ -185,12 +211,11 @@ def test_sanitize_text_redacts_arbitrary_prompt_and_namespace_from_json_and_text
 def test_collect_live_contract_sanitizes_every_capture(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    binary = tmp_path / "claude"
-    binary.write_text("binary")
+    capability = _validated_capability(tmp_path / "claude")
 
-    def fake_run(argv: list[str]) -> CommandCapture:
+    def fake_run(capability: object, suffix: tuple[str, ...]) -> CommandCapture:
         return CommandCapture(
-            tuple(argv),
+            ("validated-binary", *suffix),
             0,
             json.dumps(
                 {"agents": [{"prompt": "raw prompt", "namespace": "tenant-red"}]}
@@ -201,7 +226,7 @@ def test_collect_live_contract_sanitizes_every_capture(
         )
 
     monkeypatch.setattr("hermes_claude_sessions.characterization.run_command", fake_run)
-    contract = collect_live_contract(binary)
+    contract = collect_live_contract(capability)
     serialized = json.dumps(contract)
     assert "raw prompt" not in serialized
     assert "tenant-red" not in serialized
