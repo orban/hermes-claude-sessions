@@ -19,9 +19,11 @@ from hermes_claude_sessions.characterization import (
     _mint_worktree_probe,
     _observe_worktree_probe,
     _worktree_launch_argv,
+    _worktree_paths,
     _WorktreeProbe,
     collect_disposable_worktree_edit_characterization,
     contract_fingerprint,
+    sanitize_contract,
 )
 
 
@@ -112,6 +114,95 @@ def test_exact_argv_accept_edits_and_prompt_scope() -> None:
 def test_minted_probe_has_no_guessed_native_session_id() -> None:
     probe = _mint_worktree_probe()
     assert probe.session_id is None
+
+
+@pytest.mark.parametrize(
+    "porcelain",
+    [
+        (
+            "worktree /Volumes/private-project/owned\n"
+            "branch refs/heads/first\n\n"
+            "worktree /Volumes/private-project/owned\n"
+            "branch refs/heads/second\n"
+        ),
+        "branch refs/heads/orphan\n",
+        "worktree /opt/owned\nbranch refs/heads/first\nbranch refs/heads/second\n",
+        "worktree /opt/first\nworktree /opt/second\n",
+    ],
+)
+def test_worktree_porcelain_rejects_duplicate_and_malformed_records(
+    porcelain: str,
+) -> None:
+    with pytest.raises(CharacterizationError, match="worktree porcelain"):
+        _worktree_paths(porcelain)
+
+
+@pytest.mark.parametrize("duplicate_stage", ["before", "after"])
+def test_observation_rejects_duplicate_paths_in_either_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, duplicate_stage: str
+) -> None:
+    full = str(uuid.uuid4())
+    probe = _WorktreeProbe("worktree-duplicate-path", full, full[:8])
+    valid = f"worktree {tmp_path}\n"
+    duplicate = valid + f"\nworktree {tmp_path}\n"
+
+    def listing(*args) -> CommandCapture:
+        argv = args[2]
+        return CommandCapture(
+            argv,
+            0,
+            json.dumps(
+                [
+                    {
+                        "id": full[:8],
+                        "sessionId": full,
+                        "name": probe.display_name,
+                        "state": "completed",
+                    }
+                ]
+            ),
+            "",
+            False,
+            None,
+        )
+
+    monkeypatch.setattr(
+        "hermes_claude_sessions.characterization._run_owned_worktree_command", listing
+    )
+    monkeypatch.setattr(
+        "hermes_claude_sessions.characterization._worktree_snapshot",
+        lambda *args: duplicate if duplicate_stage == "after" else valid,
+    )
+    with pytest.raises(CharacterizationError, match="worktree porcelain"):
+        _observe_worktree_probe(
+            Path(EXACT_CLAUDE_BIN),
+            probe,
+            tmp_path,
+            duplicate if duplicate_stage == "before" else valid,
+            tmp_path / "evidence",
+            time.monotonic() + 1,
+        )
+
+
+def test_contract_sanitizer_redacts_arbitrary_absolute_paths() -> None:
+    sanitized = sanitize_contract(
+        {
+            "origin_cwd": "/Volumes/private-project/repository",
+            "worktree": {
+                "worktree_path": "/opt/private-project/worktree",
+                "effective_cwd": "/etc/private-project",
+                "diff": (
+                    "--- /Volumes/private-project/seed.txt\n"
+                    "+++ /opt/private-project/seed.txt\n"
+                    "metadata: /srv/non-home-root/repository\n"
+                ),
+            },
+        }
+    )
+    serialized = json.dumps(sanitized, sort_keys=True)
+    for leaked in ("/Volumes/", "/opt/", "/etc/", "/srv/"):
+        assert leaked not in serialized
+    assert sanitized["origin_cwd"] == "<LOCAL_PATH>"
 
 
 def test_identity_reconciliation_requires_launch_returned_short_token(
@@ -295,7 +386,7 @@ def test_sanitized_observation_is_archived_before_cleanup_even_when_cleanup_fail
     assert archived_worktree["worktree_path"] == "/private/tmp/owned"
     assert archived_worktree["primary_unchanged"] is True
     assert archived_worktree["diff"] == "+CHARACTERIZATION_EDIT\n"
-    assert archived_worktree["primary_unchanged_after_stop"] is False
+    assert archived_worktree["primary_unchanged_after_stop"] is None
 
 
 def test_observation_error_is_archived_before_exact_cleanup(
@@ -413,6 +504,64 @@ def test_post_stop_artifact_preservation_is_observed_not_inferred(
     assert result["stop_preserved_artifact"] is False
 
 
+@pytest.mark.parametrize("failure", ["cleanup", "snapshot"])
+def test_post_stop_integrity_is_unknown_when_not_observed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    rows: dict[str, dict[str, str]] = {}
+    calls: list[tuple[str, ...]] = []
+    writes: list[dict[str, object]] = []
+    _configure(monkeypatch, rows, calls)
+    monkeypatch.setattr(
+        "hermes_claude_sessions.characterization._observe_worktree_probe",
+        lambda *args: {
+            "probe_status": "probe_inconclusive",
+            "worktree_path": "/private/tmp/owned",
+            "primary_unchanged": True,
+            "diff": "",
+        },
+    )
+    monkeypatch.setattr(
+        "hermes_claude_sessions.characterization.atomic_write_contract",
+        lambda destination, contract: writes.append(contract),
+    )
+    monkeypatch.setattr(
+        "hermes_claude_sessions.characterization._preserve_worktree_diagnostics",
+        lambda root: tmp_path / "preserved",
+    )
+    if failure == "cleanup":
+        monkeypatch.setattr(
+            "hermes_claude_sessions.characterization._worktree_cleanup",
+            lambda *args: False,
+        )
+    else:
+        snapshots = 0
+
+        def fail_post_snapshot(*args):
+            nonlocal snapshots
+            snapshots += 1
+            if snapshots >= 2:
+                raise OSError("post-stop snapshot unavailable")
+            return "worktree /private/tmp/main\n"
+
+        monkeypatch.setattr(
+            "hermes_claude_sessions.characterization._worktree_snapshot",
+            fail_post_snapshot,
+        )
+
+    with pytest.raises(CharacterizationError):
+        collect_disposable_worktree_edit_characterization(
+            object(), tmp_path / f"{failure}.json"
+        )
+
+    result = writes[-1]
+    assert result["stop_preserved_artifact"] is None
+    assert result["stop_preserved_worktree"] is None
+    worktree = result["worktree"]
+    assert isinstance(worktree, dict)
+    assert worktree["primary_unchanged_after_stop"] is None
+
+
 def test_observed_diff_is_bounded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -449,7 +598,7 @@ def test_observed_diff_is_bounded(
     monkeypatch.setattr(
         "hermes_claude_sessions.characterization._worktree_snapshot",
         lambda *args: (
-            f"worktree {tmp_path}\nworktree {owned}\nbranch refs/heads/probe\n"
+            f"worktree {tmp_path}\n\nworktree {owned}\nbranch refs/heads/probe\n"
         ),
     )
     monkeypatch.setattr(
@@ -552,3 +701,4 @@ def test_live_fixture_is_fingerprinted_conservative_and_identity_free() -> None:
     assert not re.search(r"\b[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\b", serialized)
     assert not re.search(r'"(?:owned_display_id|owned_session_id)"', serialized)
     assert "/Users/" not in serialized and "/private/var/" not in serialized
+    assert not re.search(r'(?<![A-Za-z0-9:/])/(?!/)[^\s"\'<>]+', serialized)

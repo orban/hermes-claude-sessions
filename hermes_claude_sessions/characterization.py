@@ -461,6 +461,11 @@ def _sanitize_plain_text(
     result = re.sub(r"(?i)(\bnamespace\s*=\s*)[^\s,;]+", r"\1<NAMESPACE>", result)
     result = re.sub(r"(?im)(\bnamespace\s*:\s*)[^\r\n]*", r"\1<NAMESPACE>", result)
     result = re.sub(r"\b(?:ns|namespace)[_-][A-Za-z0-9_-]{8,}\b", "<NAMESPACE>", result)
+    result = re.sub(
+        r"(?<![A-Za-z0-9:/])/(?!/)(?:\\ |[^\s\"'<>])+",
+        "<LOCAL_PATH>",
+        result,
+    )
     return re.sub(r"\b[0-9a-f]{8}-[0-9a-f-]{27,}\b", "<NAMESPACE>", result, flags=re.I)
 
 
@@ -477,6 +482,16 @@ def _sanitize_value(
     if "namespace" in normalized_field:
         return "<NAMESPACE>"
     if isinstance(value, str):
+        if (
+            normalized_field
+            in {
+                "origin_cwd",
+                "worktree_path",
+                "effective_cwd",
+            }
+            and Path(value).is_absolute()
+        ):
+            return "<LOCAL_PATH>"
         return sanitize_text(
             value, username=username, sensitive_values=sensitive_values
         )
@@ -1356,12 +1371,33 @@ def _worktree_snapshot(repository: Path, deadline: float) -> str:
 def _worktree_paths(porcelain: str) -> dict[str, str | None]:
     entries: dict[str, str | None] = {}
     current: str | None = None
+    branch_seen = False
     for line in porcelain.splitlines():
+        if not line:
+            current = None
+            branch_seen = False
+            continue
         if line.startswith("worktree "):
+            if current is not None:
+                raise CharacterizationError(
+                    "malformed worktree porcelain record boundary"
+                )
             current = line.removeprefix("worktree ")
+            if not current or current in entries:
+                raise CharacterizationError(
+                    "duplicate or empty worktree porcelain path"
+                )
             entries[current] = None
-        elif current is not None and line.startswith("branch "):
+            branch_seen = False
+        elif line.startswith("branch "):
+            if current is None or branch_seen:
+                raise CharacterizationError(
+                    "malformed worktree porcelain branch record"
+                )
             entries[current] = line.removeprefix("branch ")
+            branch_seen = True
+        elif current is None:
+            raise CharacterizationError("malformed worktree porcelain record")
     return entries
 
 
@@ -1604,9 +1640,9 @@ def _worktree_artifact(
     cleanup_attempted: bool,
     diagnostics_preserved: bool,
     unrelated_unchanged: bool | None,
-    stop_preserved_artifact: bool,
-    stop_preserved_worktree: bool,
-    primary_unchanged_after_stop: bool,
+    stop_preserved_artifact: bool | None,
+    stop_preserved_worktree: bool | None,
+    primary_unchanged_after_stop: bool | None,
     error: Exception | None,
 ) -> dict[str, Any]:
     return {
@@ -1725,9 +1761,9 @@ def collect_disposable_worktree_edit_characterization(
             cleanup_attempted=False,
             diagnostics_preserved=False,
             unrelated_unchanged=None,
-            stop_preserved_artifact=False,
-            stop_preserved_worktree=False,
-            primary_unchanged_after_stop=False,
+            stop_preserved_artifact=None,
+            stop_preserved_worktree=None,
+            primary_unchanged_after_stop=None,
             error=error,
         )
         archive_error: Exception | None = None
@@ -1744,9 +1780,9 @@ def collect_disposable_worktree_edit_characterization(
             )
         if error is None and archive_error is not None:
             error = archive_error
-        stop_preserved_artifact = False
-        stop_preserved_worktree = False
-        primary_unchanged_after_stop = False
+        stop_preserved_artifact: bool | None = None
+        stop_preserved_worktree: bool | None = None
+        primary_unchanged_after_stop: bool | None = None
         if cleanup_confirmed:
             try:
                 post_stop_worktrees = _worktree_paths(
@@ -1764,6 +1800,9 @@ def collect_disposable_worktree_edit_characterization(
                         and seed.read_text(encoding="utf-8")
                         == "seed\nCHARACTERIZATION_EDIT\n"
                     )
+                else:
+                    stop_preserved_worktree = False
+                    stop_preserved_artifact = False
                 primary_unchanged_after_stop = (repository / "seed.txt").read_text(
                     encoding="utf-8"
                 ) == "seed\n"
