@@ -1588,37 +1588,96 @@ def _observe_worktree_probe(
     )
 
 
+def _require_worktree_work_budget(deadline: float, operation: str) -> None:
+    if _remaining(deadline) <= 0:
+        raise CharacterizationError(f"worktree deadline exhausted before {operation}")
+
+
+def _worktree_artifact(
+    *,
+    phase: str,
+    probe: _WorktreeProbe,
+    before_agents: Mapping[str, str],
+    repository: Path,
+    observation: Mapping[str, Any],
+    cleanup_confirmed: bool,
+    cleanup_attempted: bool,
+    diagnostics_preserved: bool,
+    unrelated_unchanged: bool | None,
+    stop_preserved_artifact: bool,
+    stop_preserved_worktree: bool,
+    primary_unchanged_after_stop: bool,
+    error: Exception | None,
+) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "artifact_phase": phase,
+        "context": "unattended_bg_disposable_worktree",
+        "fully_characterized": False,
+        "estimated_test_owned_session_count": 1,
+        "actual_test_owned_session_count": int(
+            probe.display_id is not None and probe.session_id is not None
+        ),
+        "launch_token_reconciled": probe.display_id is not None
+        and probe.session_id is not None
+        and probe.session_id not in before_agents,
+        "launch_invoked_from_origin_cwd": True,
+        "origin_cwd": str(repository),
+        "cleanup": {
+            "attempted": cleanup_attempted,
+            "confirmed": cleanup_confirmed,
+        },
+        "diagnostics_preserved": diagnostics_preserved,
+        "probe_error": type(error).__name__ if error is not None else None,
+        "unrelated_agents": {
+            "pre_existing_count": len(before_agents),
+            "unchanged": unrelated_unchanged,
+        },
+        "stop_preserved_artifact": stop_preserved_artifact,
+        "stop_preserved_worktree": stop_preserved_worktree,
+        "worktree": {
+            **observation,
+            "primary_unchanged_after_stop": primary_unchanged_after_stop,
+        },
+    }
+
+
 def collect_disposable_worktree_edit_characterization(
     capability: object, destination: Path
 ) -> dict[str, Any]:
     """Run one exact-owned edit session and retain only sanitized characterization."""
     binary = _require_exact_observer_capability(capability)
     deadline = time.monotonic() + WORKTREE_SUITE_TIMEOUT_SECONDS
+    work_deadline = deadline - WORKTREE_CLEANUP_SECONDS
     probe = _mint_worktree_probe()
     with tempfile.TemporaryDirectory(prefix="claude-worktree-") as temporary_name:
         root, repository = Path(temporary_name), Path(temporary_name) / "repository"
         repository.mkdir()
-        _initialize_seed_repository(repository, deadline)
+        _require_worktree_work_budget(work_deadline, "repository initialization")
+        _initialize_seed_repository(repository, work_deadline)
+        _require_worktree_work_budget(work_deadline, "pre-probe agent snapshot")
         before_agents_capture = _run_owned_worktree_command(
             binary,
             probe,
             (str(binary), "agents", "--json", "--all"),
             repository,
-            min(WORKTREE_TIMEOUT_SECONDS, _remaining(deadline)),
+            min(WORKTREE_TIMEOUT_SECONDS, _remaining(work_deadline)),
         )
         before_agents = _snapshot_agents(before_agents_capture)
         if before_agents is None:
             raise CharacterizationError("could not capture pre-probe agents listing")
-        before_worktrees = _worktree_snapshot(repository, deadline)
+        _require_worktree_work_budget(work_deadline, "pre-probe worktree snapshot")
+        before_worktrees = _worktree_snapshot(repository, work_deadline)
         plugin = root / "plugin"
         evidence = root / "evidence"
         _create_observer_plugin(plugin, evidence)
+        _require_worktree_work_budget(work_deadline, "background launch")
         launch = _run_owned_worktree_command(
             binary,
             probe,
             _worktree_launch_argv(binary, probe, plugin),
             repository,
-            min(WORKTREE_TIMEOUT_SECONDS, _remaining(deadline)),
+            min(WORKTREE_TIMEOUT_SECONDS, _remaining(work_deadline)),
         )
         if launch.returncode != 0 or launch.timed_out:
             raise CharacterizationError("worktree background launch failed")
@@ -1641,7 +1700,7 @@ def collect_disposable_worktree_edit_characterization(
                 probe,
                 repository,
                 before_agents,
-                deadline - WORKTREE_CLEANUP_SECONDS,
+                work_deadline,
             )
             if discovered is None:
                 raise CharacterizationError("worktree probe failed identity read-back")
@@ -1652,10 +1711,30 @@ def collect_disposable_worktree_edit_characterization(
                 repository,
                 before_worktrees,
                 evidence,
-                deadline - WORKTREE_CLEANUP_SECONDS,
+                work_deadline,
             )
         except Exception as caught:
             error = caught
+        pre_cleanup_result = _worktree_artifact(
+            phase="pre_cleanup",
+            probe=probe,
+            before_agents=before_agents,
+            repository=repository,
+            observation=observation,
+            cleanup_confirmed=False,
+            cleanup_attempted=False,
+            diagnostics_preserved=False,
+            unrelated_unchanged=None,
+            stop_preserved_artifact=False,
+            stop_preserved_worktree=False,
+            primary_unchanged_after_stop=False,
+            error=error,
+        )
+        archive_error: Exception | None = None
+        try:
+            atomic_write_contract(destination, pre_cleanup_result)
+        except Exception as caught:
+            archive_error = caught
         finally:
             cleanup_confirmed = _worktree_cleanup(
                 binary,
@@ -1663,6 +1742,8 @@ def collect_disposable_worktree_edit_characterization(
                 repository,
                 min(deadline, time.monotonic() + WORKTREE_CLEANUP_SECONDS),
             )
+        if error is None and archive_error is not None:
+            error = archive_error
         stop_preserved_artifact = False
         stop_preserved_worktree = False
         primary_unchanged_after_stop = False
@@ -1712,32 +1793,21 @@ def collect_disposable_worktree_edit_characterization(
         if not cleanup_confirmed:
             diagnostics_path = _preserve_worktree_diagnostics(root)
             diagnostics_preserved = True
-        result: dict[str, Any] = {
-            "schema_version": 1,
-            "context": "unattended_bg_disposable_worktree",
-            "fully_characterized": False,
-            "estimated_test_owned_session_count": 1,
-            "actual_test_owned_session_count": int(
-                probe.display_id is not None and probe.session_id is not None
-            ),
-            "launch_token_reconciled": probe.display_id is not None
-            and probe.session_id is not None
-            and probe.session_id not in before_agents,
-            "launch_invoked_from_origin_cwd": True,
-            "origin_cwd": str(repository),
-            "cleanup": {"confirmed": cleanup_confirmed},
-            "diagnostics_preserved": diagnostics_preserved,
-            "unrelated_agents": {
-                "pre_existing_count": len(before_agents),
-                "unchanged": unrelated_unchanged,
-            },
-            "stop_preserved_artifact": stop_preserved_artifact,
-            "stop_preserved_worktree": stop_preserved_worktree,
-            "worktree": {
-                **observation,
-                "primary_unchanged_after_stop": primary_unchanged_after_stop,
-            },
-        }
+        result = _worktree_artifact(
+            phase="post_cleanup",
+            probe=probe,
+            before_agents=before_agents,
+            repository=repository,
+            observation=observation,
+            cleanup_confirmed=cleanup_confirmed,
+            cleanup_attempted=True,
+            diagnostics_preserved=diagnostics_preserved,
+            unrelated_unchanged=unrelated_unchanged,
+            stop_preserved_artifact=stop_preserved_artifact,
+            stop_preserved_worktree=stop_preserved_worktree,
+            primary_unchanged_after_stop=primary_unchanged_after_stop,
+            error=error,
+        )
         atomic_write_contract(destination, result)
         if error is not None:
             if isinstance(error, CharacterizationError):

@@ -1,21 +1,24 @@
 {
   "actual_test_owned_session_count": 1,
+  "artifact_phase": "post_cleanup",
   "cleanup": {
+    "attempted": true,
     "confirmed": true
   },
   "context": "unattended_bg_disposable_worktree",
   "diagnostics_preserved": false,
   "estimated_test_owned_session_count": 1,
-  "fingerprint": "c57584e161c83fb0fa187f6c0f21f761ac6654c79ba56eecf398d88797883de4",
+  "fingerprint": "abe4ecf2d0eeaca95d0cb9cc8083c3106efc9da22b88884bc8bd55e21d90ed1b",
   "fully_characterized": false,
   "launch_invoked_from_origin_cwd": true,
   "launch_token_reconciled": true,
   "origin_cwd": "<TEMP_PATH>",
+  "probe_error": null,
   "schema_version": 1,
   "stop_preserved_artifact": false,
   "stop_preserved_worktree": false,
   "unrelated_agents": {
-    "pre_existing_count": 56,
+    "pre_existing_count": 57,
     "unchanged": true
   },
   "worktree": {

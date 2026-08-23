@@ -10,7 +10,9 @@ import pytest
 
 from hermes_claude_sessions.characterization import (
     EXACT_CLAUDE_BIN,
+    WORKTREE_CLEANUP_SECONDS,
     WORKTREE_DIFF_LIMIT,
+    WORKTREE_SUITE_TIMEOUT_SECONDS,
     CharacterizationError,
     CommandCapture,
     _discover_worktree_identity,
@@ -240,6 +242,130 @@ def test_identity_finally_cleanup_sanitization_and_unrelated_preservation(
         "--bg",
         "stop",
     ]
+
+
+def test_sanitized_observation_is_archived_before_cleanup_even_when_cleanup_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rows: dict[str, dict[str, str]] = {}
+    calls: list[tuple[str, ...]] = []
+    events: list[str] = []
+    writes: list[dict[str, object]] = []
+    _configure(monkeypatch, rows, calls)
+    monkeypatch.setattr(
+        "hermes_claude_sessions.characterization._observe_worktree_probe",
+        lambda *args: {
+            "probe_status": "probe_inconclusive",
+            "worktree_path": "/private/tmp/owned",
+            "primary_unchanged": True,
+            "diff": "+CHARACTERIZATION_EDIT\n",
+        },
+    )
+
+    def archive(destination: Path, contract: dict[str, object]) -> None:
+        del destination
+        events.append("archive")
+        writes.append(contract)
+
+    def fail_cleanup(*args) -> bool:
+        events.append("cleanup")
+        return False
+
+    monkeypatch.setattr(
+        "hermes_claude_sessions.characterization.atomic_write_contract", archive
+    )
+    monkeypatch.setattr(
+        "hermes_claude_sessions.characterization._worktree_cleanup", fail_cleanup
+    )
+    monkeypatch.setattr(
+        "hermes_claude_sessions.characterization._preserve_worktree_diagnostics",
+        lambda root: tmp_path / "preserved",
+    )
+
+    with pytest.raises(CharacterizationError, match="cleanup could not be confirmed"):
+        collect_disposable_worktree_edit_characterization(
+            object(), tmp_path / "failure.json"
+        )
+
+    assert events[:2] == ["archive", "cleanup"]
+    assert writes[0]["artifact_phase"] == "pre_cleanup"
+    archived_worktree = writes[0]["worktree"]
+    assert isinstance(archived_worktree, dict)
+    assert archived_worktree["probe_status"] == "probe_inconclusive"
+    assert archived_worktree["worktree_path"] == "/private/tmp/owned"
+    assert archived_worktree["primary_unchanged"] is True
+    assert archived_worktree["diff"] == "+CHARACTERIZATION_EDIT\n"
+    assert archived_worktree["primary_unchanged_after_stop"] is False
+
+
+def test_observation_error_is_archived_before_exact_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rows: dict[str, dict[str, str]] = {}
+    calls: list[tuple[str, ...]] = []
+    events: list[str] = []
+    writes: list[dict[str, object]] = []
+    _configure(monkeypatch, rows, calls)
+    monkeypatch.setattr(
+        "hermes_claude_sessions.characterization._observe_worktree_probe",
+        lambda *args: (_ for _ in ()).throw(TimeoutError()),
+    )
+
+    def archive(destination: Path, contract: dict[str, object]) -> None:
+        del destination
+        events.append("archive")
+        writes.append(contract)
+
+    def confirm_cleanup(*args) -> bool:
+        events.append("cleanup")
+        return True
+
+    monkeypatch.setattr(
+        "hermes_claude_sessions.characterization.atomic_write_contract", archive
+    )
+    monkeypatch.setattr(
+        "hermes_claude_sessions.characterization._worktree_cleanup", confirm_cleanup
+    )
+
+    with pytest.raises(CharacterizationError, match="observation failed: TimeoutError"):
+        collect_disposable_worktree_edit_characterization(
+            object(), tmp_path / "failure.json"
+        )
+
+    assert events[:2] == ["archive", "cleanup"]
+    assert writes[0]["artifact_phase"] == "pre_cleanup"
+    assert writes[0]["probe_error"] == "TimeoutError"
+
+
+def test_setup_cannot_consume_cleanup_reserve_or_begin_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rows: dict[str, dict[str, str]] = {}
+    calls: list[tuple[str, ...]] = []
+    now = [100.0]
+    _configure(monkeypatch, rows, calls)
+    monkeypatch.setattr(
+        "hermes_claude_sessions.characterization.time.monotonic", lambda: now[0]
+    )
+
+    def consume_work_budget(repository: Path, deadline: float) -> None:
+        (repository / "seed.txt").write_text("seed\n")
+        assert deadline == pytest.approx(
+            100.0 + WORKTREE_SUITE_TIMEOUT_SECONDS - WORKTREE_CLEANUP_SECONDS
+        )
+        now[0] = deadline
+
+    monkeypatch.setattr(
+        "hermes_claude_sessions.characterization._initialize_seed_repository",
+        consume_work_budget,
+    )
+
+    with pytest.raises(CharacterizationError, match="deadline exhausted before"):
+        collect_disposable_worktree_edit_characterization(
+            object(), tmp_path / "reserve.json"
+        )
+
+    assert not [call for call in calls if call[1] == "--bg"]
 
 
 def test_post_stop_artifact_preservation_is_observed_not_inferred(
