@@ -271,6 +271,18 @@ def _capture_windows_until_deadline(
         return None, False, True
 
 
+def _wait_for_process_until(process: subprocess.Popen[bytes], deadline: float) -> bool:
+    """Reap a direct child without blocking beyond an absolute deadline."""
+    remaining = max(0.0, deadline - time.monotonic())
+    if remaining <= 0:
+        return process.poll() is not None
+    try:
+        process.wait(timeout=remaining)
+        return True
+    except subprocess.TimeoutExpired:
+        return False
+
+
 def _run_command(
     argv: Sequence[str],
     *,
@@ -281,7 +293,12 @@ def _run_command(
     """Run argv privately with a deadline covering the child and both pipe EOFs."""
     if output_limit < 0:
         raise ValueError("output_limit must not be negative")
+    if timeout_seconds < 0:
+        raise ValueError("timeout_seconds must not be negative")
     normalized_argv = tuple(argv)
+    hard_deadline = time.monotonic() + timeout_seconds
+    termination_reserve = min(TERMINATION_GRACE_SECONDS, timeout_seconds / 2)
+    capture_deadline = hard_deadline - termination_reserve
     try:
         process = subprocess.Popen(
             normalized_argv,
@@ -298,30 +315,27 @@ def _run_command(
 
     stdout = bytearray()
     stderr = bytearray()
-    deadline = time.monotonic() + timeout_seconds
     if os.name == "posix":
         returncode, direct_child_reaped, timed_out = _capture_posix_until_deadline(
-            process, stdout, stderr, output_limit, deadline
+            process, stdout, stderr, output_limit, capture_deadline
         )
     else:
         returncode, direct_child_reaped, timed_out = _capture_windows_until_deadline(
-            process, stdout, stderr, output_limit, deadline
+            process, stdout, stderr, output_limit, capture_deadline
         )
 
     if timed_out:
         _terminate_process_tree(process)
         if not direct_child_reaped:
-            try:
-                process.wait(timeout=TERMINATION_GRACE_SECONDS)
-                direct_child_reaped = True
-            except subprocess.TimeoutExpired:
-                _kill_process_tree(process)
-                process.wait(timeout=TERMINATION_GRACE_SECONDS)
-                direct_child_reaped = True
+            remaining = max(0.0, hard_deadline - time.monotonic())
+            term_deadline = min(hard_deadline, time.monotonic() + (remaining / 2))
+            direct_child_reaped = _wait_for_process_until(process, term_deadline)
         # The direct child can exit while a contained descendant holds a pipe.
-        # Always force the original POSIX group after the bounded TERM chance.
-        if os.name == "posix":
+        # Force the original POSIX group after the bounded TERM chance.
+        if os.name == "posix" or not direct_child_reaped:
             _kill_process_tree(process)
+        if not direct_child_reaped:
+            direct_child_reaped = _wait_for_process_until(process, hard_deadline)
         if os.name != "posix":
             assert process.stdout is not None
             assert process.stderr is not None

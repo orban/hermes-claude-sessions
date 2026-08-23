@@ -32,6 +32,7 @@ from hermes_claude_sessions.characterization import (
     _mint_owned_probe,
     _owned_rows,
     _owned_session_id,
+    _OwnedProbe,
     _run_command,
     _run_owned_observer_command,
     atomic_write_contract,
@@ -116,6 +117,28 @@ def test_private_runner_captures_timeout_and_os_error() -> None:
     assert missing.returncode is None
     assert missing.error
     assert "definitely/not/a/command" in missing.error
+
+
+@pytest.mark.skipif(os.name != "posix", reason="signal behavior is POSIX-specific")
+def test_private_runner_timeout_is_a_hard_wall_clock_budget() -> None:
+    timeout_seconds = 0.1
+    started = time.monotonic()
+    capture = _run_command(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import signal, time; "
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                "time.sleep(30)"
+            ),
+        ],
+        timeout_seconds=timeout_seconds,
+    )
+    elapsed = time.monotonic() - started
+
+    assert capture.timed_out is True
+    assert elapsed < 0.4
 
 
 @pytest.mark.skipif(
@@ -795,7 +818,7 @@ def test_probe_fails_without_identity_readback_and_never_guesses_stop(
     )
     monkeypatch.setattr(
         "hermes_claude_sessions.characterization.OBSERVER_SUITE_TIMEOUT_SECONDS",
-        0.05,
+        0.5,
     )
     started = time.monotonic()
     with pytest.raises(CharacterizationError, match="failed identity read-back"):
@@ -1086,6 +1109,103 @@ def test_post_launch_identity_timeout_preserves_cleanup_reserve(
         0 <= timeout <= min(OBSERVER_TIMEOUT_SECONDS, 13.0 - called_at)
         for _, timeout, called_at in calls
     )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="signal behavior is POSIX-specific")
+def test_hard_command_deadlines_leave_time_for_all_exact_observer_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tokens: dict[str, str] = {}
+    stopped: list[str] = []
+
+    def token_for(name: str) -> str:
+        if name not in tokens:
+            tokens[name] = f"deadbee{len(tokens)}"
+        return tokens[name]
+
+    def fake_run(
+        binary: Path,
+        owned: _OwnedProbe,
+        argv: tuple[str, ...],
+        cwd: Path,
+        timeout: float,
+    ) -> CommandCapture:
+        del binary, cwd, timeout
+        display_name = owned.display_name
+        display_id = owned.display_id
+        session_id = owned.session_id
+        if argv[1] == "--bg":
+            token = token_for(display_name)
+            return CommandCapture(
+                argv,
+                0,
+                f"backgrounded · {token} · {display_name}\n",
+                "",
+                False,
+                None,
+            )
+        if argv[1] == "stop":
+            stopped.append(argv[2])
+            return CommandCapture(argv, 0, "", "", False, None)
+        if argv[1:3] == ("agents", "--json"):
+            rows = []
+            if display_id is not None and session_id is None:
+                rows = [
+                    {
+                        "id": display_id,
+                        "sessionId": f"{display_id}-0000-4000-8000-000000000000",
+                        "name": display_name,
+                        "state": "running",
+                    }
+                ]
+            return CommandCapture(argv, 0, json.dumps(rows), "", False, None)
+        raise AssertionError(argv)
+
+    def slow_observation(*_: object) -> tuple[bool, bool, set[str]]:
+        capture = _run_command(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import signal, time; "
+                    "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                    "time.sleep(30)"
+                ),
+            ],
+            timeout_seconds=0.1,
+        )
+        assert capture.timed_out is True
+        return True, False, set()
+
+    monkeypatch.setattr(
+        "hermes_claude_sessions.characterization._require_exact_observer_capability",
+        lambda _: Path(EXACT_CLAUDE_BIN),
+    )
+    monkeypatch.setattr(
+        "hermes_claude_sessions.characterization._run_owned_observer_command",
+        fake_run,
+    )
+    monkeypatch.setattr(
+        "hermes_claude_sessions.characterization._observe_exact_owned",
+        slow_observation,
+    )
+    monkeypatch.setattr(
+        "hermes_claude_sessions.characterization.OBSERVER_SUITE_TIMEOUT_SECONDS", 2.0
+    )
+    monkeypatch.setattr(
+        "hermes_claude_sessions.characterization.OBSERVER_CLEANUP_SECONDS", 0.2
+    )
+
+    started = time.monotonic()
+    result = collect_unattended_observer_hook_characterization(
+        object(), tmp_path / "hard-deadline.json"
+    )
+    elapsed = time.monotonic() - started
+
+    assert result["actual_test_owned_session_count"] == 4
+    assert result["cleanup"]["confirmed"] is True
+    assert stopped == list(tokens.values())
+    assert elapsed < 2.0
 
 
 def test_live_fixture_contains_no_raw_launch_output() -> None:
