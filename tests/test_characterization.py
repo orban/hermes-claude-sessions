@@ -25,6 +25,7 @@ from hermes_claude_sessions.characterization import (
     CharacterizationError,
     CommandCapture,
     _create_observer_plugin,
+    _launch_display_id,
     _mint_owned_probe,
     _owned_rows,
     _owned_session_id,
@@ -580,6 +581,11 @@ def test_unattended_probe_isolates_exact_uuid_cases_and_waits_before_stop(
             name = argv[3]
             session_id = f"{uuid.uuid4()}"
             active[session_id] = f"completed:{name}"
+            output = (
+                "Starting background service…\n"
+                f"backgrounded · {session_id[:8]} · {name}\n"
+            )
+            return CommandCapture(argv, 0, output, "", False, None)
         elif argv[1] == "stop":
             session_id = next(key for key in active if key.startswith(f"{argv[2]}-"))
             active.pop(session_id)
@@ -642,6 +648,118 @@ def test_owned_session_identity_is_a_uuid_separate_from_display_name() -> None:
     session_id = _owned_session_id()
     assert str(uuid.UUID(session_id)) == session_id
     assert not session_id.startswith("observer-")
+
+
+def test_launch_display_id_requires_exact_owned_background_response() -> None:
+    owned = _mint_owned_probe("idle_prompt")
+    output = (
+        "Starting background service…\n"
+        f"backgrounded · 11cc4577 · {owned.display_name}\n"
+        "  claude stop 11cc4577      stop this session"
+    )
+    assert _launch_display_id(output, owned) == "11cc4577"
+    assert _launch_display_id(output.replace("11cc4577", "not-an-id"), owned) is None
+    assert (
+        _launch_display_id(output.replace(owned.display_name, "unrelated"), owned)
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "failure", ["identity_timeout", "identity_ambiguity", "observer"]
+)
+def test_every_post_launch_failure_still_stops_exact_launch_tokens(
+    failure: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[str, ...]] = []
+    unrelated_id = "aaaaaaaa-1111-4111-8111-111111111111"
+    rows: dict[str, dict[str, str]] = {
+        unrelated_id: {
+            "id": "aaaaaaaa",
+            "sessionId": unrelated_id,
+            "name": "unrelated",
+            "state": "blocked",
+        }
+    }
+
+    def fake_run(
+        binary: Path,
+        owned: object,
+        argv: tuple[str, ...],
+        cwd: Path,
+        timeout: float,
+    ) -> CommandCapture:
+        calls.append(argv)
+        if argv[1] == "--bg":
+            session_id = str(uuid.uuid4())
+            rows[session_id] = {
+                "id": session_id[:8],
+                "sessionId": session_id,
+                "name": argv[3],
+                "state": "blocked",
+            }
+            output = f"backgrounded · {session_id[:8]} · {argv[3]}\n"
+            return CommandCapture(argv, 0, output, "", False, None)
+        if argv[1] == "stop":
+            match = next(row for row in rows.values() if row["id"] == argv[2])
+            match["state"] = "stopped"
+            return CommandCapture(argv, 0, "", "", False, None)
+        if argv[1:3] == ("agents", "--json"):
+            return CommandCapture(
+                argv, 0, json.dumps(list(rows.values())), "", False, None
+            )
+        raise AssertionError(argv)
+
+    monkeypatch.setattr(
+        "hermes_claude_sessions.characterization._require_exact_observer_capability",
+        lambda _: Path(EXACT_CLAUDE_BIN),
+    )
+    monkeypatch.setattr(
+        "hermes_claude_sessions.characterization._run_owned_observer_command",
+        fake_run,
+    )
+    if failure == "identity_timeout":
+        monkeypatch.setattr(
+            "hermes_claude_sessions.characterization._discover_native_identity",
+            lambda *args: None,
+        )
+    elif failure == "identity_ambiguity":
+
+        def ambiguous(*args: object) -> None:
+            raise CharacterizationError("ambiguous native identity")
+
+        monkeypatch.setattr(
+            "hermes_claude_sessions.characterization._discover_native_identity",
+            ambiguous,
+        )
+    else:
+
+        def observer_failure(*args: object) -> None:
+            raise OSError("test-owned evidence unavailable")
+
+        monkeypatch.setattr(
+            "hermes_claude_sessions.characterization._observe_exact_owned",
+            observer_failure,
+        )
+
+    with pytest.raises(CharacterizationError):
+        collect_unattended_observer_hook_characterization(
+            object(), tmp_path / f"{failure}.json"
+        )
+
+    launches = [argv for argv in calls if argv[1] == "--bg"]
+    stops = [argv for argv in calls if argv[1] == "stop"]
+    assert len(launches) == len(OBSERVER_EVENT_MATCHERS[2:])
+    assert len(stops) == len(launches)
+    assert {argv[2] for argv in stops} == {
+        row["id"] for row in rows.values() if row["name"].startswith("observer-")
+    }
+    assert rows[unrelated_id]["state"] == "blocked"
+    assert all(
+        row["state"] == "stopped"
+        for row in rows.values()
+        if row["name"].startswith("observer-")
+    )
 
 
 def test_probe_fails_without_identity_readback_and_never_guesses_stop(

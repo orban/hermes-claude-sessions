@@ -663,6 +663,16 @@ def _mint_owned_probe(matcher: str) -> _OwnedProbe:
     return _OwnedProbe(f"observer-{matcher}-{namespace}", matcher)
 
 
+def _launch_display_id(output: str, owned: _OwnedProbe) -> str | None:
+    """Extract Claude's exact short cleanup token from a successful bg launch."""
+    pattern = re.compile(
+        rf"^backgrounded · ([0-9a-f]{{8}}) · {re.escape(owned.display_name)}$",
+        re.MULTILINE,
+    )
+    matches = pattern.findall(output)
+    return matches[0] if len(matches) == 1 else None
+
+
 def _agent_identity(item: Mapping[str, Any]) -> str | None:
     full = item.get("sessionId")
     short = item.get("id")
@@ -676,9 +686,22 @@ def _owned_rows(rows: object, owned: _OwnedProbe) -> list[Mapping[str, Any]]:
     for item in rows:
         if not isinstance(item, Mapping):
             continue
-        if owned.session_id is not None and item.get("sessionId") == owned.session_id:
-            matches.append(item)
-        if owned.session_id is None and item.get("name") == owned.display_name:
+        if owned.session_id is not None:
+            if (
+                item.get("sessionId") == owned.session_id
+                and item.get("id") == owned.display_id
+                and item.get("name") == owned.display_name
+            ):
+                matches.append(item)
+            continue
+        if owned.display_id is not None:
+            if (
+                item.get("id") == owned.display_id
+                and item.get("name") == owned.display_name
+            ):
+                matches.append(item)
+            continue
+        if item.get("name") == owned.display_name:
             matches.append(item)
     return matches
 
@@ -928,6 +951,7 @@ def collect_unattended_observer_hook_characterization(
     owned_cases = [(matcher, _mint_owned_probe(matcher)) for matcher in cases]
     per_case: dict[str, dict[str, Any]] = {}
     cleanup_failures: list[str] = []
+    probe_failures: list[str] = []
     with tempfile.TemporaryDirectory(prefix="claude-observer-") as temporary_name:
         root = Path(temporary_name)
         repository = root / "repository"
@@ -981,42 +1005,67 @@ def collect_unattended_observer_hook_characterization(
                 repository,
                 min(OBSERVER_TIMEOUT_SECONDS, _remaining(work_deadline)),
             )
-            discovered = _discover_native_identity(
-                binary, owned, repository, before, work_deadline
+            launch_succeeded = launch.returncode == 0 and not launch.timed_out
+            launch_display_id = (
+                _launch_display_id(launch.stdout, owned) if launch_succeeded else None
             )
-            if discovered is not None:
-                owned = discovered
-            observed_identity_seen, completed, observed = _observe_exact_owned(
-                binary, owned, repository, evidence, work_deadline
-            )
-            identity_seen = discovered is not None or observed_identity_seen
+            if launch_display_id is not None:
+                owned = dataclasses.replace(owned, display_id=launch_display_id)
+            identity_seen = False
+            completed = False
+            observed: set[str] = set()
             cleanup_confirmed = False
             stop: CommandCapture | None = None
             after: CommandCapture | None = None
-            if owned.session_id is not None and owned.display_id is not None:
-                cleanup_deadline = min(
-                    deadline, time.monotonic() + OBSERVER_CLEANUP_SECONDS
-                )
-                cleanup_confirmed, stop, after = _cleanup_owned(
-                    binary, owned, repository, cleanup_deadline
-                )
-            else:
-                # A failed launch never authorizes stop; prove exact absence read-only.
-                after = _listing(
-                    binary,
-                    owned,
-                    repository,
-                    min(OBSERVER_TIMEOUT_SECONDS, _remaining(deadline)),
-                )
-                cleanup_confirmed = False
-                if after.returncode == 0 and not after.timed_out:
-                    try:
-                        cleanup_confirmed = (
-                            _owned_row(json.loads(after.stdout), owned) is None
+            probe_error: str | None = None
+            try:
+                if not launch_succeeded:
+                    probe_error = "background launch failed"
+                elif launch_display_id is None:
+                    probe_error = "successful launch omitted exact cleanup token"
+                else:
+                    discovered = _discover_native_identity(
+                        binary, owned, repository, before, work_deadline
+                    )
+                    if discovered is None:
+                        probe_error = "native identity read-back timed out"
+                    else:
+                        owned = discovered
+                        identity_seen = True
+                        observed_identity_seen, completed, observed = (
+                            _observe_exact_owned(
+                                binary, owned, repository, evidence, work_deadline
+                            )
                         )
-                    except json.JSONDecodeError:
-                        cleanup_confirmed = False
+                        identity_seen = identity_seen or observed_identity_seen
+            except Exception as error:  # cleanup is mandatory after accepted launch
+                probe_error = f"post-launch {type(error).__name__}"
+            finally:
+                if owned.display_id is not None:
+                    cleanup_deadline = min(
+                        deadline, time.monotonic() + OBSERVER_CLEANUP_SECONDS
+                    )
+                    cleanup_confirmed, stop, after = _cleanup_owned(
+                        binary, owned, repository, cleanup_deadline
+                    )
+                else:
+                    # Without Claude's launch token, stop is not safely authorized.
+                    after = _listing(
+                        binary,
+                        owned,
+                        repository,
+                        min(OBSERVER_TIMEOUT_SECONDS, _remaining(deadline)),
+                    )
+                    if after.returncode == 0 and not after.timed_out:
+                        try:
+                            cleanup_confirmed = (
+                                _owned_row(json.loads(after.stdout), owned) is None
+                            )
+                        except json.JSONDecodeError:
+                            cleanup_confirmed = False
             observed |= _read_evidence(evidence)
+            if probe_error is not None:
+                probe_failures.append(f"{matcher}: {probe_error}")
             if not cleanup_confirmed:
                 cleanup_failures.append(owned.session_id or owned.display_name)
             per_case[matcher] = {
@@ -1029,6 +1078,7 @@ def collect_unattended_observer_hook_characterization(
                 "cleanup_confirmed": cleanup_confirmed,
                 "stop": stop,
                 "after": after,
+                "probe_error": probe_error,
             }
         events = _event_rows(per_case)
         after_unrelated = _snapshot_agents(
@@ -1073,6 +1123,7 @@ def collect_unattended_observer_hook_characterization(
                     "launch_stderr_present": bool(case["launch"].stderr),
                     "launch_stderr_bytes": len(case["launch"].stderr.encode("utf-8")),
                     "metadata_records": case["metadata_records"],
+                    "probe_error": case["probe_error"],
                 }
                 for matcher, case in per_case.items()
             ],
@@ -1095,6 +1146,10 @@ def collect_unattended_observer_hook_characterization(
             raise CharacterizationError(
                 "cleanup could not be confirmed for exact owned session "
                 + ", ".join(cleanup_failures)
+            )
+        if probe_failures:
+            raise CharacterizationError(
+                "one or more observer probes failed: " + "; ".join(probe_failures)
             )
         if not unrelated_untouched:
             raise CharacterizationError(

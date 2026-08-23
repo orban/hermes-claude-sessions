@@ -27,15 +27,18 @@ sessions: one for each Notification matcher (`permission_prompt`, `idle_prompt`,
 `agent_needs_input`, and `agent_completed`). Each case has a separate temporary
 `--plugin-dir`, evidence directory, and UUID-suffixed `observer-*` display name.
 Claude's `--bg` mode ignores `--session-id`, so the probe snapshots native state,
-launches by unique name, then binds exactly one returned full `sessionId` and
-short `id`. All cases use `manual`; no auto-approval mode is used.
+launches by unique name, parses the exact short cleanup token from Claude's
+`backgrounded · <id> · <name>` response, then cross-checks that token and name
+against exactly one returned full `sessionId`. All cases use `manual`; no
+auto-approval mode is used.
 
-It writes only bounded event metadata under its temporary directory, performs a
-read-only observation poll before cleanup, stops only the exact short ID bound
-to that unique test-owned name, and verifies absence or a terminal stopped state. A
-cleanup verification failure raises with the exact owned ID; it never broadens
-cleanup. It also compares pre-existing unrelated session identities/states
-before and after. The committed
+It writes only bounded event metadata under its temporary directory and performs
+a read-only observation poll before cleanup. Every accepted launch enters a
+`finally` cleanup path that stops only its launch-returned short ID, including
+identity-readback timeout, ambiguity, and observer failures. Cleanup then verifies
+absence or a terminal stopped state; a verification failure raises with the exact
+owned ID and never broadens cleanup. It also compares pre-existing unrelated
+session identities/states before and after. The committed
 `unattended_observer_hooks.fixture.json` is schema-only, sanitized, and is not
 live evidence. Permission, lifecycle/worktree, state-normalization, and runtime
 integration characterization remain deferred.
