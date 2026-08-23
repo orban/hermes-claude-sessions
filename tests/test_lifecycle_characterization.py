@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 import uuid
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from hermes_claude_sessions.characterization import (
     CommandCapture,
     _classify_daemon,
     _classify_lifecycle_roster,
+    _lifecycle_cleanup,
     _lifecycle_launch_argv,
     _LifecycleProbe,
     _run_owned_lifecycle_command,
@@ -65,6 +67,18 @@ def test_daemon_classifier_is_conservative(output: str, expected: str) -> None:
         (EXACT_CLAUDE_BIN, "daemon", "status"), 0, output, "", False, None
     )
     assert _classify_daemon(capture) == expected
+
+
+def test_daemon_classifier_recognizes_explicit_not_running_on_nonzero_exit() -> None:
+    capture = CommandCapture(
+        (EXACT_CLAUDE_BIN, "daemon", "status"),
+        1,
+        "Daemon is not running",
+        "",
+        False,
+        None,
+    )
+    assert _classify_daemon(capture) == "not_running"
 
 
 @pytest.mark.parametrize(
@@ -409,6 +423,79 @@ def test_new_respawn_token_is_the_final_cleanup_capability_on_ambiguity(
     ):
         collect_unattended_lifecycle_characterization(object(), tmp_path / "out.json")
     assert stop_targets[-1] == "22222222"
+
+
+@pytest.mark.parametrize(
+    "owned_rows",
+    [
+        [
+            {
+                "id": "deadbeef",
+                "sessionId": "not-a-canonical-uuid",
+                "name": "lifecycle-unique-name",
+                "state": "stopped",
+            }
+        ],
+        [
+            {
+                "id": "deadbeef",
+                "sessionId": "deadbeef-1111-4111-8111-111111111111",
+                "state": "stopped",
+            }
+        ],
+        [
+            {
+                "id": "changed1",
+                "sessionId": "deadbeef-1111-4111-8111-111111111111",
+                "name": "lifecycle-unique-name",
+                "state": "stopped",
+            }
+        ],
+        [
+            {
+                "id": "deadbeef",
+                "sessionId": "deadbeef-1111-4111-8111-111111111111",
+                "name": "lifecycle-unique-name",
+                "state": "stopped",
+            },
+            {
+                "id": "deadbeef",
+                "sessionId": "deadbeef-1111-4111-8111-111111111111",
+                "name": "lifecycle-unique-name",
+                "state": "stopped",
+            },
+        ],
+    ],
+)
+def test_lifecycle_cleanup_rejects_malformed_or_duplicate_owned_candidates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    owned_rows: list[dict[str, object]],
+) -> None:
+    probe = _LifecycleProbe(
+        "lifecycle-unique-name",
+        "deadbeef",
+        "deadbeef-1111-4111-8111-111111111111",
+    )
+
+    def run(
+        binary: Path,
+        candidate: _LifecycleProbe,
+        argv: tuple[str, ...],
+        cwd: Path,
+        timeout: float,
+    ) -> CommandCapture:
+        del binary, candidate, cwd, timeout
+        if argv[1] == "stop":
+            return CommandCapture(argv, 0, "", "", False, None)
+        return CommandCapture(argv, 0, json.dumps(owned_rows), "", False, None)
+
+    monkeypatch.setattr(
+        "hermes_claude_sessions.characterization._run_owned_lifecycle_command", run
+    )
+    assert not _lifecycle_cleanup(
+        Path(EXACT_CLAUDE_BIN), probe, tmp_path, time.monotonic() + 1
+    )
 
 
 def test_live_lifecycle_fixture_is_sanitized_fingerprinted_and_conservative() -> None:

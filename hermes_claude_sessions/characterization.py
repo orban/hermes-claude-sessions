@@ -1982,12 +1982,12 @@ def _lifecycle_listing(
 
 def _classify_daemon(capture: CommandCapture) -> str:
     """Classify only explicit daemon text; absence of evidence remains unknown."""
-    if capture.returncode != 0 or capture.timed_out or capture.error:
+    if capture.timed_out or capture.error:
         return "unparseable"
     text = f"{capture.stdout}\n{capture.stderr}".lower()
     if re.search(r"\b(not running|stopped|not started)\b", text):
         return "not_running"
-    if re.search(r"\b(running|started|active)\b", text):
+    if capture.returncode == 0 and re.search(r"\b(running|started|active)\b", text):
         return "running"
     return "unparseable"
 
@@ -2173,10 +2173,11 @@ def _lifecycle_cleanup(
         )
         if capture.returncode == 0 and not capture.timed_out:
             try:
-                matches = _owned_rows(
-                    json.loads(capture.stdout), _lifecycle_owned(probe)
-                )
+                rows = json.loads(capture.stdout)
             except json.JSONDecodeError:
+                return False
+            matches = _strict_lifecycle_owned_candidates(rows, probe)
+            if matches is None:
                 return False
             if not matches or (
                 len(matches) == 1 and matches[0].get("state") in _TERMINAL_STATES
@@ -2186,6 +2187,42 @@ def _lifecycle_cleanup(
                 return False
         time.sleep(min(LIFECYCLE_POLL_SECONDS, _remaining(deadline)))
     return False
+
+
+def _strict_lifecycle_owned_candidates(
+    rows: object, probe: _LifecycleProbe
+) -> list[Mapping[str, Any]] | None:
+    """Return exact owned rows, distinguishing absence from malformed ownership."""
+    if not isinstance(rows, list) or probe.display_id is None:
+        return None
+    matches: list[Mapping[str, Any]] = []
+    for item in rows:
+        if not isinstance(item, Mapping):
+            continue
+        full = item.get("sessionId")
+        candidate = (
+            item.get("name") == probe.display_name
+            or item.get("id") == probe.display_id
+            or (probe.session_id is not None and full == probe.session_id)
+        )
+        if not candidate:
+            continue
+        try:
+            canonical = isinstance(full, str) and str(uuid.UUID(full)) == full
+        except ValueError:
+            canonical = False
+        exact = (
+            canonical
+            and item.get("name") == probe.display_name
+            and item.get("id") == probe.display_id
+            and isinstance(full, str)
+            and full[:8] == probe.display_id
+            and (probe.session_id is None or full == probe.session_id)
+        )
+        if not exact:
+            return None
+        matches.append(item)
+    return matches
 
 
 def collect_unattended_lifecycle_characterization(
