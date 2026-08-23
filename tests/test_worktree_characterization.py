@@ -128,6 +128,8 @@ def test_minted_probe_has_no_guessed_native_session_id() -> None:
         "branch refs/heads/orphan\n",
         "worktree /opt/owned\nbranch refs/heads/first\nbranch refs/heads/second\n",
         "worktree /opt/first\nworktree /opt/second\n",
+        "worktree /opt/owned\nbranch \n",
+        "worktree /opt/owned\nnot-a-git-record\n",
     ],
 )
 def test_worktree_porcelain_rejects_duplicate_and_malformed_records(
@@ -135,6 +137,22 @@ def test_worktree_porcelain_rejects_duplicate_and_malformed_records(
 ) -> None:
     with pytest.raises(CharacterizationError, match="worktree porcelain"):
         _worktree_paths(porcelain)
+
+
+def test_worktree_porcelain_accepts_documented_record_attributes() -> None:
+    oid = "a" * 40
+    porcelain = (
+        f"worktree /opt/normal\nHEAD {oid}\nbranch refs/heads/main\n"
+        "locked maintenance\nprunable stale metadata\n\n"
+        f"worktree /opt/detached\nHEAD {oid}\ndetached\n\n"
+        "worktree /opt/bare\nbare\n"
+    )
+
+    assert _worktree_paths(porcelain) == {
+        "/opt/normal": "refs/heads/main",
+        "/opt/detached": None,
+        "/opt/bare": None,
+    }
 
 
 @pytest.mark.parametrize("duplicate_stage", ["before", "after"])

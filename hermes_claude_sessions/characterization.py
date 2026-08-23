@@ -1371,11 +1371,13 @@ def _worktree_snapshot(repository: Path, deadline: float) -> str:
 def _worktree_paths(porcelain: str) -> dict[str, str | None]:
     entries: dict[str, str | None] = {}
     current: str | None = None
-    branch_seen = False
+    attributes_seen: set[str] = set()
+    checkout_kind: str | None = None
     for line in porcelain.splitlines():
         if not line:
             current = None
-            branch_seen = False
+            attributes_seen = set()
+            checkout_kind = None
             continue
         if line.startswith("worktree "):
             if current is not None:
@@ -1388,16 +1390,47 @@ def _worktree_paths(porcelain: str) -> dict[str, str | None]:
                     "duplicate or empty worktree porcelain path"
                 )
             entries[current] = None
-            branch_seen = False
-        elif line.startswith("branch "):
-            if current is None or branch_seen:
+            attributes_seen = set()
+            checkout_kind = None
+            continue
+        if current is None:
+            raise CharacterizationError("malformed worktree porcelain record")
+
+        attribute, separator, value = line.partition(" ")
+        if attribute not in {
+            "HEAD",
+            "branch",
+            "detached",
+            "bare",
+            "locked",
+            "prunable",
+        }:
+            raise CharacterizationError("unknown worktree porcelain record attribute")
+        if attribute in attributes_seen:
+            raise CharacterizationError("duplicate worktree porcelain record attribute")
+        attributes_seen.add(attribute)
+
+        if attribute == "HEAD":
+            if not separator or not value:
+                raise CharacterizationError("malformed worktree porcelain HEAD record")
+            continue
+        if attribute == "branch":
+            if not separator or not value or checkout_kind is not None:
                 raise CharacterizationError(
                     "malformed worktree porcelain branch record"
                 )
-            entries[current] = line.removeprefix("branch ")
-            branch_seen = True
-        elif current is None:
-            raise CharacterizationError("malformed worktree porcelain record")
+            entries[current] = value
+            checkout_kind = attribute
+            continue
+        if attribute in {"detached", "bare"}:
+            if separator or checkout_kind is not None:
+                raise CharacterizationError(
+                    "malformed worktree porcelain checkout record"
+                )
+            checkout_kind = attribute
+            continue
+        if separator and not value:
+            raise CharacterizationError("malformed worktree porcelain status record")
     return entries
 
 
