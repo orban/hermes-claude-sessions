@@ -1897,3 +1897,586 @@ def collect_disposable_worktree_edit_characterization(
                 "pre-existing unrelated agent states changed during worktree probe"
             )
         return sanitize_contract(result)
+
+
+# Task 0C-B keeps lifecycle mutation private to this collector.
+LIFECYCLE_TIMEOUT_SECONDS = 10.0
+LIFECYCLE_SUITE_TIMEOUT_SECONDS = 70.0
+LIFECYCLE_CLEANUP_SECONDS = 10.0
+LIFECYCLE_POLL_SECONDS = 0.2
+_TERMINAL_STATES = frozenset(("completed", "failed", "stopped"))
+
+
+@dataclasses.dataclass(frozen=True)
+class _LifecycleProbe:
+    """The only lifecycle target this module can ever mutate."""
+
+    display_name: str
+    display_id: str | None = None
+    session_id: str | None = None
+
+
+def _mint_lifecycle_probe() -> _LifecycleProbe:
+    return _LifecycleProbe(f"lifecycle-{uuid.uuid4()}")
+
+
+def _lifecycle_prompt() -> str:
+    return (
+        "Read only. Do not edit files, run commands, create files, or request "
+        "permissions. Reply with exactly: lifecycle characterization ready."
+    )
+
+
+def _lifecycle_launch_argv(binary: Path, probe: _LifecycleProbe) -> tuple[str, ...]:
+    return (
+        str(binary),
+        "--bg",
+        "--name",
+        probe.display_name,
+        "--permission-mode",
+        "manual",
+        _lifecycle_prompt(),
+    )
+
+
+def _lifecycle_owned(probe: _LifecycleProbe) -> _OwnedProbe:
+    return _OwnedProbe(
+        probe.display_name, "lifecycle", probe.session_id, probe.display_id
+    )
+
+
+def _run_owned_lifecycle_command(
+    binary: Path,
+    probe: _LifecycleProbe,
+    argv: tuple[str, ...],
+    cwd: Path,
+    timeout: float,
+) -> CommandCapture:
+    """Run an exact, collector-minted lifecycle command and nothing else."""
+    if not argv or argv[0] != str(binary):
+        raise CharacterizationError("lifecycle command must use the validated binary")
+    suffix = argv[1:]
+    identifiers = {value for value in (probe.display_id, probe.session_id) if value}
+    allowed = suffix in {
+        ("--version",),
+        ("agents", "--json", "--all"),
+        ("daemon", "status"),
+        _lifecycle_launch_argv(binary, probe)[1:],
+    }
+    if len(suffix) == 2 and suffix[0] in {"logs", "stop", "respawn"}:
+        allowed = suffix[1] in identifiers
+    if not allowed:
+        raise CharacterizationError("lifecycle command shape is not probe-owned")
+    return _run_command_within_total_budget(
+        argv, total_timeout_seconds=timeout, cwd=cwd
+    )
+
+
+def _lifecycle_listing(
+    binary: Path, probe: _LifecycleProbe, cwd: Path, timeout: float
+) -> CommandCapture:
+    return _run_owned_lifecycle_command(
+        binary, probe, (str(binary), "agents", "--json", "--all"), cwd, timeout
+    )
+
+
+def _classify_daemon(capture: CommandCapture) -> str:
+    """Classify only explicit daemon text; absence of evidence remains unknown."""
+    if capture.returncode != 0 or capture.timed_out or capture.error:
+        return "unparseable"
+    text = f"{capture.stdout}\n{capture.stderr}".lower()
+    if re.search(r"\b(not running|stopped|not started)\b", text):
+        return "not_running"
+    if re.search(r"\b(running|started|active)\b", text):
+        return "running"
+    return "unparseable"
+
+
+def _classify_lifecycle_roster(rows: list[Mapping[str, Any]]) -> str:
+    """Classify an exact-owned roster match without normalizing ambiguity."""
+    if len(rows) == 0:
+        return "stale"
+    if len(rows) != 1:
+        return "ambiguous"
+    state = rows[0].get("state")
+    if not isinstance(state, str):
+        return "ambiguous"
+    return "recoverable" if state in _TERMINAL_STATES else "active"
+
+
+def _lifecycle_roster_snapshot(
+    binary: Path, probe: _LifecycleProbe, cwd: Path, deadline: float
+) -> str:
+    if _remaining(deadline) <= 0:
+        return "ambiguous"
+    capture = _lifecycle_listing(
+        binary, probe, cwd, min(LIFECYCLE_TIMEOUT_SECONDS, _remaining(deadline))
+    )
+    if capture.returncode != 0 or capture.timed_out or capture.error:
+        return "ambiguous"
+    try:
+        rows = _owned_rows(json.loads(capture.stdout), _lifecycle_owned(probe))
+    except json.JSONDecodeError:
+        return "ambiguous"
+    return _classify_lifecycle_roster(rows)
+
+
+def _archive_lifecycle_checkpoint(
+    destination: Path,
+    *,
+    pending_mutation: str,
+    version: str,
+    lifecycle: Mapping[str, str],
+    acceptance: Mapping[str, Mapping[str, str]],
+    daemon: Mapping[str, str],
+    roster: Mapping[str, str],
+) -> None:
+    """Persist bounded sanitized evidence before an exploratory mutation."""
+    atomic_write_contract(
+        destination,
+        {
+            "schema_version": 1,
+            "artifact_phase": "pre_mutation",
+            "pending_mutation": pending_mutation,
+            "context": "unattended_bg",
+            "attended": False,
+            "fully_characterized": False,
+            "version": version,
+            "lifecycle": dict(lifecycle),
+            "identifier_acceptance": {
+                command: dict(spellings) for command, spellings in acceptance.items()
+            },
+            "daemon": dict(daemon),
+            "roster": dict(roster),
+            "cleanup": {"attempted": False, "confirmed": False},
+            "manual_gates_deferred": [
+                "attach",
+                "permission_denial",
+                "sleep",
+                "shutdown_restart",
+            ],
+        },
+    )
+
+
+def _daemon_snapshot(
+    binary: Path, probe: _LifecycleProbe, cwd: Path, deadline: float
+) -> str:
+    if _remaining(deadline) <= 0:
+        return "unparseable"
+    return _classify_daemon(
+        _run_owned_lifecycle_command(
+            binary,
+            probe,
+            (str(binary), "daemon", "status"),
+            cwd,
+            min(LIFECYCLE_TIMEOUT_SECONDS, _remaining(deadline)),
+        )
+    )
+
+
+def _reconcile_lifecycle_identity(
+    binary: Path, probe: _LifecycleProbe, cwd: Path, excluded: set[str], deadline: float
+) -> _LifecycleProbe | None:
+    """Bind exact name + launch token to one canonical UUID, never a prefix guess."""
+    while _remaining(deadline) > 0:
+        capture = _lifecycle_listing(
+            binary, probe, cwd, min(LIFECYCLE_TIMEOUT_SECONDS, _remaining(deadline))
+        )
+        if capture.returncode == 0 and not capture.timed_out:
+            try:
+                matches = _owned_rows(
+                    json.loads(capture.stdout), _lifecycle_owned(probe)
+                )
+            except json.JSONDecodeError:
+                matches = []
+            if len(matches) > 1:
+                raise CharacterizationError("ambiguous lifecycle native identity")
+            if len(matches) == 1:
+                row = matches[0]
+                full, short = row.get("sessionId"), row.get("id")
+                try:
+                    canonical = isinstance(full, str) and str(uuid.UUID(full)) == full
+                except ValueError:
+                    canonical = False
+                if (
+                    canonical
+                    and isinstance(full, str)
+                    and isinstance(short, str)
+                    and short == probe.display_id
+                    and full[:8] == short
+                    and full not in excluded
+                ):
+                    return dataclasses.replace(probe, session_id=full)
+        time.sleep(min(LIFECYCLE_POLL_SECONDS, _remaining(deadline)))
+    return None
+
+
+def _transition_to_terminal(
+    binary: Path, probe: _LifecycleProbe, cwd: Path, deadline: float
+) -> str:
+    valid_nonterminal_seen = False
+    while _remaining(deadline) > 0:
+        capture = _lifecycle_listing(
+            binary, probe, cwd, min(LIFECYCLE_TIMEOUT_SECONDS, _remaining(deadline))
+        )
+        if capture.returncode == 0 and not capture.timed_out:
+            try:
+                matches = _owned_rows(
+                    json.loads(capture.stdout), _lifecycle_owned(probe)
+                )
+            except json.JSONDecodeError:
+                return "probe_inconclusive"
+            if len(matches) != 1:
+                return "probe_inconclusive"
+            if matches[0].get("state") in _TERMINAL_STATES:
+                return "observed"
+            valid_nonterminal_seen = True
+        time.sleep(min(LIFECYCLE_POLL_SECONDS, _remaining(deadline)))
+    return "not_observed" if valid_nonterminal_seen else "probe_inconclusive"
+
+
+def _lifecycle_operation(
+    binary: Path,
+    probe: _LifecycleProbe,
+    command: str,
+    identifier: str,
+    cwd: Path,
+    deadline: float,
+) -> str:
+    if _remaining(deadline) <= 0:
+        return "probe_inconclusive"
+    capture = _run_owned_lifecycle_command(
+        binary,
+        probe,
+        (str(binary), command, identifier),
+        cwd,
+        min(LIFECYCLE_TIMEOUT_SECONDS, _remaining(deadline)),
+    )
+    if capture.timed_out or capture.error:
+        return "probe_inconclusive"
+    return "accepted" if capture.returncode == 0 else "rejected"
+
+
+def _lifecycle_cleanup(
+    binary: Path, probe: _LifecycleProbe, cwd: Path, deadline: float
+) -> bool:
+    if (
+        probe.display_id is None
+        or _lifecycle_operation(binary, probe, "stop", probe.display_id, cwd, deadline)
+        != "accepted"
+    ):
+        return False
+    while _remaining(deadline) > 0:
+        capture = _lifecycle_listing(
+            binary, probe, cwd, min(LIFECYCLE_TIMEOUT_SECONDS, _remaining(deadline))
+        )
+        if capture.returncode == 0 and not capture.timed_out:
+            try:
+                matches = _owned_rows(
+                    json.loads(capture.stdout), _lifecycle_owned(probe)
+                )
+            except json.JSONDecodeError:
+                return False
+            if not matches or (
+                len(matches) == 1 and matches[0].get("state") in _TERMINAL_STATES
+            ):
+                return True
+            if len(matches) > 1:
+                return False
+        time.sleep(min(LIFECYCLE_POLL_SECONDS, _remaining(deadline)))
+    return False
+
+
+def collect_unattended_lifecycle_characterization(
+    capability: object, destination: Path
+) -> dict[str, Any]:
+    """Safely characterize stop/respawn and target spelling for one owned session."""
+    binary = _require_exact_observer_capability(capability)
+    deadline = time.monotonic() + LIFECYCLE_SUITE_TIMEOUT_SECONDS
+    work_deadline = deadline - LIFECYCLE_CLEANUP_SECONDS
+    probe = _mint_lifecycle_probe()
+    with tempfile.TemporaryDirectory(prefix="claude-lifecycle-") as temporary_name:
+        repository = Path(temporary_name) / "repository"
+        repository.mkdir()
+        _initialize_seed_repository(repository, work_deadline)
+        before = _snapshot_agents(
+            _lifecycle_listing(
+                binary,
+                probe,
+                repository,
+                min(LIFECYCLE_TIMEOUT_SECONDS, _remaining(work_deadline)),
+            )
+        )
+        if before is None:
+            raise CharacterizationError(
+                "could not capture pre-lifecycle agents listing"
+            )
+        version_capture = _run_owned_lifecycle_command(
+            binary,
+            probe,
+            (str(binary), "--version"),
+            repository,
+            min(LIFECYCLE_TIMEOUT_SECONDS, _remaining(work_deadline)),
+        )
+        version = (version_capture.stdout or version_capture.stderr).strip()
+        if version_capture.returncode != 0 or version_capture.timed_out:
+            version = "unparseable"
+        daemon = {
+            "before_launch": _daemon_snapshot(binary, probe, repository, work_deadline)
+        }
+        roster = {
+            "before_launch": _lifecycle_roster_snapshot(
+                binary, probe, repository, work_deadline
+            )
+        }
+        acceptance = {
+            command: {"short": "probe_inconclusive", "full_uuid": "probe_inconclusive"}
+            for command in ("logs", "stop", "respawn")
+        }
+        lifecycle = {
+            "stop_transition": "probe_inconclusive",
+            "respawn_identity": "probe_inconclusive",
+        }
+
+        def archive_before(command: str, spelling: str) -> None:
+            _archive_lifecycle_checkpoint(
+                destination,
+                pending_mutation=f"{command}:{spelling}",
+                version=version,
+                lifecycle=lifecycle,
+                acceptance=acceptance,
+                daemon=daemon,
+                roster=roster,
+            )
+
+        launched = identity_reconciled = cleanup_confirmed = False
+        error: Exception | None = None
+        try:
+            launch = _run_owned_lifecycle_command(
+                binary,
+                probe,
+                _lifecycle_launch_argv(binary, probe),
+                repository,
+                min(LIFECYCLE_TIMEOUT_SECONDS, _remaining(work_deadline)),
+            )
+            if launch.returncode != 0 or launch.timed_out:
+                raise CharacterizationError("lifecycle background launch failed")
+            token = _launch_display_id(launch.stdout, _lifecycle_owned(probe))
+            if token is None:
+                raise CharacterizationError(
+                    "lifecycle launch omitted exact cleanup token"
+                )
+            launched, probe = True, dataclasses.replace(probe, display_id=token)
+            reconciled = _reconcile_lifecycle_identity(
+                binary, probe, repository, set(before), work_deadline
+            )
+            if reconciled is None:
+                raise CharacterizationError("lifecycle identity read-back failed")
+            probe = reconciled
+            identity_reconciled = True
+            daemon["after_launch"] = _daemon_snapshot(
+                binary, probe, repository, work_deadline
+            )
+            roster["after_launch"] = _lifecycle_roster_snapshot(
+                binary, probe, repository, work_deadline
+            )
+            assert probe.display_id is not None and probe.session_id is not None
+            for spelling, identifier in (
+                ("short", probe.display_id),
+                ("full_uuid", probe.session_id),
+            ):
+                acceptance["logs"][spelling] = _lifecycle_operation(
+                    binary, probe, "logs", identifier, repository, work_deadline
+                )
+            archive_before("stop", "short")
+            acceptance["stop"]["short"] = _lifecycle_operation(
+                binary, probe, "stop", probe.display_id, repository, work_deadline
+            )
+            lifecycle["stop_transition"] = (
+                _transition_to_terminal(binary, probe, repository, work_deadline)
+                if acceptance["stop"]["short"] == "accepted"
+                else "probe_inconclusive"
+                if acceptance["stop"]["short"] == "probe_inconclusive"
+                else "not_observed"
+            )
+            roster["after_stop"] = _lifecycle_roster_snapshot(
+                binary, probe, repository, work_deadline
+            )
+            archive_before("respawn", "short")
+            respawn = _run_owned_lifecycle_command(
+                binary,
+                probe,
+                (str(binary), "respawn", probe.display_id),
+                repository,
+                min(LIFECYCLE_TIMEOUT_SECONDS, _remaining(work_deadline)),
+            )
+            acceptance["respawn"]["short"] = (
+                "probe_inconclusive"
+                if respawn.timed_out or respawn.error
+                else "accepted"
+                if respawn.returncode == 0
+                else "rejected"
+            )
+            token = _launch_display_id(respawn.stdout, _lifecycle_owned(probe))
+            if acceptance["respawn"]["short"] == "accepted":
+                previous_session_id = probe.session_id
+                candidate = (
+                    dataclasses.replace(probe, display_id=token, session_id=None)
+                    if token is not None
+                    else probe
+                )
+                probe = candidate
+                respawned = _reconcile_lifecycle_identity(
+                    binary, candidate, repository, set(), work_deadline
+                )
+                if respawned is not None:
+                    lifecycle["respawn_identity"] = (
+                        "preserved"
+                        if respawned.session_id == previous_session_id
+                        else "replaced"
+                    )
+                    probe = respawned
+                else:
+                    acceptance["respawn"]["short"] = "probe_inconclusive"
+                    raise CharacterizationError(
+                        "respawned lifecycle identity read-back failed"
+                    )
+            daemon["after_respawn"] = _daemon_snapshot(
+                binary, probe, repository, work_deadline
+            )
+            roster["after_respawn"] = _lifecycle_roster_snapshot(
+                binary, probe, repository, work_deadline
+            )
+            assert probe.display_id is not None and probe.session_id is not None
+            archive_before("stop", "full_uuid")
+            acceptance["stop"]["full_uuid"] = _lifecycle_operation(
+                binary, probe, "stop", probe.session_id, repository, work_deadline
+            )
+            archive_before("respawn", "full_uuid")
+            respawn = _run_owned_lifecycle_command(
+                binary,
+                probe,
+                (str(binary), "respawn", probe.session_id),
+                repository,
+                min(LIFECYCLE_TIMEOUT_SECONDS, _remaining(work_deadline)),
+            )
+            acceptance["respawn"]["full_uuid"] = (
+                "probe_inconclusive"
+                if respawn.timed_out or respawn.error
+                else "accepted"
+                if respawn.returncode == 0
+                else "rejected"
+            )
+            token = _launch_display_id(respawn.stdout, _lifecycle_owned(probe))
+            if acceptance["respawn"]["full_uuid"] == "accepted":
+                candidate = (
+                    dataclasses.replace(probe, display_id=token, session_id=None)
+                    if token is not None
+                    else probe
+                )
+                probe = candidate
+                respawned = _reconcile_lifecycle_identity(
+                    binary, candidate, repository, set(), work_deadline
+                )
+                if respawned is not None:
+                    probe = respawned
+                else:
+                    acceptance["respawn"]["full_uuid"] = "probe_inconclusive"
+                    raise CharacterizationError(
+                        "respawned lifecycle identity read-back failed"
+                    )
+        except Exception as caught:
+            error = caught
+        pre_cleanup = {
+            "schema_version": 1,
+            "artifact_phase": "pre_cleanup",
+            "context": "unattended_bg",
+            "attended": False,
+            "fully_characterized": False,
+            "live_evidence": True,
+            "estimated_test_owned_session_count": 1,
+            "actual_test_owned_session_count": 1 if identity_reconciled else 0,
+            "launch_token_reconciled": identity_reconciled,
+            "probe_status": "probe_inconclusive",
+            "version": version,
+            "lifecycle": lifecycle,
+            "identifier_acceptance": acceptance,
+            "daemon": daemon,
+            "roster": roster,
+            "cleanup": {"attempted": launched, "confirmed": False},
+            "manual_gates_deferred": [
+                "attach",
+                "permission_denial",
+                "sleep",
+                "shutdown_restart",
+            ],
+        }
+        archive_error: Exception | None = None
+        try:
+            atomic_write_contract(destination, pre_cleanup)
+        except Exception as caught:
+            archive_error = caught
+        finally:
+            if launched:
+                cleanup_confirmed = _lifecycle_cleanup(
+                    binary,
+                    probe,
+                    repository,
+                    min(deadline, time.monotonic() + LIFECYCLE_CLEANUP_SECONDS),
+                )
+            daemon["after_final_stop"] = _daemon_snapshot(
+                binary, probe, repository, deadline
+            )
+            roster["after_final_stop"] = _lifecycle_roster_snapshot(
+                binary, probe, repository, deadline
+            )
+        after = _snapshot_agents(
+            _lifecycle_listing(
+                binary,
+                probe,
+                repository,
+                min(LIFECYCLE_TIMEOUT_SECONDS, _remaining(deadline)),
+            )
+        )
+        unrelated_unchanged = (
+            after is not None and {key: after.get(key) for key in before} == before
+        )
+        result = {
+            **pre_cleanup,
+            "artifact_phase": "post_cleanup",
+            "daemon": daemon,
+            "roster": roster,
+            "cleanup": {"attempted": launched, "confirmed": cleanup_confirmed},
+            "unrelated_agents": {
+                "pre_existing_count": len(before),
+                "unchanged": unrelated_unchanged,
+            },
+            "probe_error": type(error).__name__
+            if error
+            else type(archive_error).__name__
+            if archive_error
+            else None,
+        }
+        result["probe_status"] = (
+            "observed"
+            if error is None
+            and cleanup_confirmed
+            and lifecycle["stop_transition"] == "observed"
+            and lifecycle["respawn_identity"] in {"preserved", "replaced"}
+            else "probe_inconclusive"
+        )
+        atomic_write_contract(destination, result)
+        if error is not None:
+            raise error
+        if archive_error is not None:
+            raise CharacterizationError(
+                "lifecycle artifact archival failed"
+            ) from archive_error
+        if not cleanup_confirmed:
+            raise CharacterizationError("lifecycle cleanup could not be confirmed")
+        if not unrelated_unchanged:
+            raise CharacterizationError(
+                "pre-existing unrelated agent states changed during lifecycle probe"
+            )
+        return sanitize_contract(result)

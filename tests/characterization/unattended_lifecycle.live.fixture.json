@@ -1,0 +1,60 @@
+{
+  "actual_test_owned_session_count": 1,
+  "artifact_phase": "post_cleanup",
+  "attended": false,
+  "cleanup": {
+    "attempted": true,
+    "confirmed": true
+  },
+  "context": "unattended_bg",
+  "daemon": {
+    "after_final_stop": "running",
+    "after_launch": "running",
+    "after_respawn": "running",
+    "before_launch": "unparseable"
+  },
+  "estimated_test_owned_session_count": 1,
+  "fingerprint": "b0e0f121eedb33087e8d178adfe60f26d503b99fd0d44615ed706fae6c28ec2d",
+  "fully_characterized": false,
+  "identifier_acceptance": {
+    "logs": {
+      "full_uuid": "rejected",
+      "short": "accepted"
+    },
+    "respawn": {
+      "full_uuid": "rejected",
+      "short": "accepted"
+    },
+    "stop": {
+      "full_uuid": "rejected",
+      "short": "accepted"
+    }
+  },
+  "launch_token_reconciled": true,
+  "lifecycle": {
+    "respawn_identity": "preserved",
+    "stop_transition": "observed"
+  },
+  "live_evidence": true,
+  "manual_gates_deferred": [
+    "attach",
+    "permission_denial",
+    "sleep",
+    "shutdown_restart"
+  ],
+  "probe_error": null,
+  "probe_status": "observed",
+  "roster": {
+    "after_final_stop": "recoverable",
+    "after_launch": "active",
+    "after_respawn": "active",
+    "after_stop": "recoverable",
+    "before_launch": "stale"
+  },
+  "schema_version": 1,
+  "unrelated_agents": {
+    "pre_existing_count": 63,
+    "unchanged": true
+  },
+  "version": "2.1.241 (Claude Code)"
+}

@@ -75,3 +75,25 @@ characterization. The sanitized live fixture records the current probe as
 worktree or edit existed before exact cleanup. This is not evidence that
 background worktrees are unsupported; the manual permission/lifecycle matrix
 must resolve why the unattended probe blocked.
+
+## Unattended lifecycle probe (Task 0C-B)
+
+`test_lifecycle_live.py` uses the same explicit cost acknowledgements and exact
+`${HOME}/.local/bin/claude` gate. It makes one fresh, locally committed disposable
+Git repository and starts one UUID-named `--bg` session in `manual` mode with a
+read-only prompt. It snapshots `agents --json --all` and `daemon status` before
+launch, binds the launch-returned short token to exactly one name-matching
+canonical UUID absent from the pre-snapshot, then tests only that identity.
+
+It records read-only `logs` acceptance for the short token and full UUID, then
+reversibly tests stop/respawn spellings one at a time. A respawn is accepted only
+when its current exact identity can be reconciled; an output token is required
+when native identity changes. The final cleanup always targets only the current
+reconciled short token and requires absence or one terminal exact row. The daemon
+is never restarted or killed; output is classified only as `running`,
+`not_running`, or `unparseable`. Exact roster evidence is recorded separately as
+`active`, `recoverable`, `stale`, or `ambiguous` at each lifecycle boundary.
+The committed live fixture is sanitized and fingerprinted, records the observed
+2.1.241 behavior, and intentionally remains
+`fully_characterized: false`; attach, permission denial, sleep, and
+shutdown/restart remain manual gates.
