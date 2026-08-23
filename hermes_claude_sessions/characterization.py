@@ -841,11 +841,18 @@ def _discover_native_identity(
                 row = matches[0]
                 full = row.get("sessionId")
                 short = row.get("id")
+                canonical_uuid = False
+                if isinstance(full, str):
+                    try:
+                        canonical_uuid = str(uuid.UUID(full)) == full
+                    except ValueError:
+                        canonical_uuid = False
                 if (
                     isinstance(full, str)
                     and isinstance(short, str)
+                    and canonical_uuid
                     and full not in pre_existing
-                    and full.startswith(f"{short}-")
+                    and full[:8] == short
                 ):
                     return dataclasses.replace(owned, session_id=full, display_id=short)
         time.sleep(min(0.2, _remaining(deadline)))
@@ -872,13 +879,19 @@ def _cleanup_owned(
         )
         if latest.returncode == 0 and not latest.timed_out:
             try:
-                row = _owned_row(json.loads(latest.stdout), owned)
+                matches = _owned_rows(json.loads(latest.stdout), owned)
             except json.JSONDecodeError:
-                row = None
-            if row is None or (
-                isinstance(row.get("state"), str)
-                and row["state"] in {"completed", "failed", "stopped"}
-            ):
+                matches = None
+            absent = matches is not None and len(matches) == 0
+            terminal = (
+                matches is not None
+                and len(matches) == 1
+                and (
+                    isinstance(matches[0].get("state"), str)
+                    and matches[0]["state"] in {"completed", "failed", "stopped"}
+                )
+            )
+            if absent or terminal:
                 return stop.returncode == 0 and not stop.timed_out, stop, latest
         time.sleep(min(0.2, _remaining(deadline)))
     return False, stop, latest
@@ -1059,7 +1072,7 @@ def collect_unattended_observer_hook_characterization(
                     if after.returncode == 0 and not after.timed_out:
                         try:
                             cleanup_confirmed = (
-                                _owned_row(json.loads(after.stdout), owned) is None
+                                len(_owned_rows(json.loads(after.stdout), owned)) == 0
                             )
                         except json.JSONDecodeError:
                             cleanup_confirmed = False

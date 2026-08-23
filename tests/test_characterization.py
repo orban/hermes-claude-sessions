@@ -20,11 +20,14 @@ from hermes_claude_sessions.characterization import (
     EXACT_CLAUDE_BIN,
     MAX_OUTPUT_BYTES,
     OBSERVER_EVENT_MATCHERS,
+    OBSERVER_TIMEOUT_SECONDS,
     REQUIRED_AGENT_OBJECT_KEYS,
     AcknowledgedClaudeBinary,
     CharacterizationError,
     CommandCapture,
+    _cleanup_owned,
     _create_observer_plugin,
+    _discover_native_identity,
     _launch_display_id,
     _mint_owned_probe,
     _owned_rows,
@@ -835,6 +838,251 @@ def test_duplicate_owned_name_is_ambiguous() -> None:
         {"id": "22222222", "sessionId": str(uuid.uuid4()), "name": owned.display_name},
     ]
     assert len(_owned_rows(rows, owned)) == 2
+
+
+@pytest.mark.parametrize(
+    "session_id",
+    [
+        "deadbeef-not-a-uuid",
+        "cafebabe-1111-4111-8111-111111111111",
+        None,
+    ],
+)
+def test_identity_readback_rejects_noncanonical_or_missing_full_uuid(
+    session_id: str | None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    owned = _mint_owned_probe("idle_prompt")
+    owned = type(owned)(
+        matcher=owned.matcher,
+        display_name=owned.display_name,
+        display_id="deadbeef",
+    )
+    row = {
+        "id": "deadbeef",
+        "sessionId": session_id,
+        "name": owned.display_name,
+        "state": "running",
+    }
+
+    monkeypatch.setattr(
+        "hermes_claude_sessions.characterization._listing",
+        lambda *args: CommandCapture(
+            (EXACT_CLAUDE_BIN, "agents", "--json", "--all"),
+            0,
+            json.dumps([row]),
+            "",
+            False,
+            None,
+        ),
+    )
+    monkeypatch.setattr(
+        "hermes_claude_sessions.characterization.time.sleep", lambda _: None
+    )
+
+    assert (
+        _discover_native_identity(
+            Path(EXACT_CLAUDE_BIN),
+            owned,
+            tmp_path,
+            {},
+            time.monotonic() + 0.01,
+        )
+        is None
+    )
+
+
+def test_cleanup_rejects_duplicate_exact_nonterminal_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session_id = "deadbeef-1111-4111-8111-111111111111"
+    owned = _mint_owned_probe("idle_prompt")
+    owned = type(owned)(
+        matcher=owned.matcher,
+        display_name=owned.display_name,
+        session_id=session_id,
+        display_id="deadbeef",
+    )
+    duplicate = {
+        "id": owned.display_id,
+        "sessionId": owned.session_id,
+        "name": owned.display_name,
+        "state": "blocked",
+    }
+
+    monkeypatch.setattr(
+        "hermes_claude_sessions.characterization._run_owned_observer_command",
+        lambda binary, owned, argv, cwd, timeout: CommandCapture(
+            argv, 0, "", "", False, None
+        ),
+    )
+    monkeypatch.setattr(
+        "hermes_claude_sessions.characterization._listing",
+        lambda *args: CommandCapture(
+            (EXACT_CLAUDE_BIN, "agents", "--json", "--all"),
+            0,
+            json.dumps([duplicate, duplicate]),
+            "",
+            False,
+            None,
+        ),
+    )
+    monkeypatch.setattr(
+        "hermes_claude_sessions.characterization.time.sleep", lambda _: None
+    )
+
+    confirmed, _, _ = _cleanup_owned(
+        Path(EXACT_CLAUDE_BIN), owned, tmp_path, time.monotonic() + 0.01
+    )
+
+    assert confirmed is False
+
+
+def test_probe_fails_when_cleanup_listing_has_duplicate_exact_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rows: dict[str, dict[str, str]] = {}
+    stopped: set[str] = set()
+    calls: list[tuple[str, ...]] = []
+
+    def fake_run(
+        binary: Path,
+        owned: object,
+        argv: tuple[str, ...],
+        cwd: Path,
+        timeout: float,
+    ) -> CommandCapture:
+        calls.append(argv)
+        if argv[1] == "--bg":
+            session_id = str(uuid.uuid4())
+            rows[session_id] = {
+                "id": session_id[:8],
+                "sessionId": session_id,
+                "name": argv[3],
+                "state": "blocked",
+            }
+            return CommandCapture(
+                argv,
+                0,
+                f"backgrounded · {session_id[:8]} · {argv[3]}\n",
+                "",
+                False,
+                None,
+            )
+        if argv[1] == "stop":
+            stopped.add(argv[2])
+            return CommandCapture(argv, 0, "", "", False, None)
+        if argv[1:3] == ("agents", "--json"):
+            listed = [
+                row
+                for row in rows.values()
+                for _ in range(2 if row["id"] in stopped else 1)
+            ]
+            return CommandCapture(argv, 0, json.dumps(listed), "", False, None)
+        raise AssertionError(argv)
+
+    monkeypatch.setattr(
+        "hermes_claude_sessions.characterization._require_exact_observer_capability",
+        lambda _: Path(EXACT_CLAUDE_BIN),
+    )
+    monkeypatch.setattr(
+        "hermes_claude_sessions.characterization._run_owned_observer_command",
+        fake_run,
+    )
+    monkeypatch.setattr(
+        "hermes_claude_sessions.characterization._observe_exact_owned",
+        lambda binary, owned, cwd, evidence, deadline: (True, False, set()),
+    )
+    monkeypatch.setattr(
+        "hermes_claude_sessions.characterization.OBSERVER_CLEANUP_SECONDS", 0.01
+    )
+    monkeypatch.setattr(
+        "hermes_claude_sessions.characterization.time.sleep", lambda _: None
+    )
+
+    with pytest.raises(CharacterizationError, match="cleanup could not be confirmed"):
+        collect_unattended_observer_hook_characterization(
+            object(), tmp_path / "duplicates.json"
+        )
+
+    stops = [argv for argv in calls if argv[1] == "stop"]
+    assert len(stops) == len(OBSERVER_EVENT_MATCHERS[2:])
+    assert {argv[2] for argv in stops} == {row["id"] for row in rows.values()}
+
+
+def test_post_launch_identity_timeout_preserves_cleanup_reserve(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = 0.0
+    calls: list[tuple[tuple[str, ...], float, float]] = []
+    stopped: list[str] = []
+
+    def monotonic() -> float:
+        return now
+
+    def sleep(seconds: float) -> None:
+        nonlocal now
+        assert seconds >= 0
+        now += seconds
+
+    def fake_run(
+        binary: Path,
+        owned: object,
+        argv: tuple[str, ...],
+        cwd: Path,
+        timeout: float,
+    ) -> CommandCapture:
+        assert timeout >= 0
+        calls.append((argv, timeout, now))
+        if argv[1] == "--bg":
+            return CommandCapture(
+                argv,
+                0,
+                f"backgrounded · deadbeef · {argv[3]}\n",
+                "",
+                False,
+                None,
+            )
+        if argv[1] == "stop":
+            stopped.append(argv[2])
+        if argv[1:3] == ("agents", "--json"):
+            return CommandCapture(argv, 0, "[]", "", False, None)
+        return CommandCapture(argv, 0, "", "", False, None)
+
+    monkeypatch.setattr(
+        "hermes_claude_sessions.characterization._require_exact_observer_capability",
+        lambda _: Path(EXACT_CLAUDE_BIN),
+    )
+    monkeypatch.setattr(
+        "hermes_claude_sessions.characterization._run_owned_observer_command",
+        fake_run,
+    )
+    monkeypatch.setattr(
+        "hermes_claude_sessions.characterization._run_command",
+        lambda argv, timeout_seconds, cwd=None: CommandCapture(
+            tuple(argv), 0, "", "", False, None
+        ),
+    )
+    monkeypatch.setattr(
+        "hermes_claude_sessions.characterization.OBSERVER_SUITE_TIMEOUT_SECONDS", 13.0
+    )
+    monkeypatch.setattr(
+        "hermes_claude_sessions.characterization.time.monotonic", monotonic
+    )
+    monkeypatch.setattr("hermes_claude_sessions.characterization.time.sleep", sleep)
+
+    with pytest.raises(CharacterizationError, match="failed identity read-back"):
+        collect_unattended_observer_hook_characterization(
+            object(), tmp_path / "timeout.json"
+        )
+
+    launches = [argv for argv, _, _ in calls if argv[1] == "--bg"]
+    assert len(launches) == len(OBSERVER_EVENT_MATCHERS[2:])
+    assert stopped == ["deadbeef"] * len(launches)
+    assert now <= 13.0
+    assert all(
+        0 <= timeout <= min(OBSERVER_TIMEOUT_SECONDS, 13.0 - called_at)
+        for _, timeout, called_at in calls
+    )
 
 
 def test_live_fixture_contains_no_raw_launch_output() -> None:
