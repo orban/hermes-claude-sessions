@@ -1,0 +1,17 @@
+{
+  "context": "unattended_bg",
+  "estimated_test_owned_session_count": 1,
+  "events": [
+    {"event": "SessionStart", "status": "probe_inconclusive"},
+    {"event": "SessionEnd", "status": "probe_inconclusive"},
+    {"event": "permission_prompt", "status": "probe_inconclusive"},
+    {"event": "idle_prompt", "status": "probe_inconclusive"},
+    {"event": "agent_needs_input", "status": "probe_inconclusive"},
+    {"event": "agent_completed", "status": "probe_inconclusive"}
+  ],
+  "fully_characterized": false,
+  "manual_gates_deferred": ["permission", "lifecycle", "worktree"],
+  "raw_evidence_retained": false,
+  "schema_version": 1,
+  "source": "deterministic_schema_fixture_no_live_probe"
+}

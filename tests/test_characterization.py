@@ -13,15 +13,21 @@ from pathlib import Path
 
 import pytest
 
+# Task 0B imports are intentionally separate: they specify the bounded,
+# opt-in observer-hook path without widening Task 0A's public command runner.
 from hermes_claude_sessions.characterization import (
+    EXACT_CLAUDE_BIN,
     MAX_OUTPUT_BYTES,
+    OBSERVER_EVENT_MATCHERS,
     REQUIRED_AGENT_OBJECT_KEYS,
     AcknowledgedClaudeBinary,
     CharacterizationError,
     CommandCapture,
+    _create_observer_plugin,
     _run_command,
     atomic_write_contract,
     collect_live_contract,
+    collect_unattended_observer_hook_characterization,
     contract_fingerprint,
     extract_required_contract,
     run_command,
@@ -478,3 +484,142 @@ def test_atomic_contract_output_is_sanitized_and_complete(tmp_path: Path) -> Non
     assert "ryo" not in serialized
     assert "unique prompt" not in serialized
     assert not list(tmp_path.glob(".contract.json.*.tmp"))
+
+
+def test_observer_plugin_is_non_deciding_and_observer_never_emits_output(
+    tmp_path: Path,
+) -> None:
+    plugin = tmp_path / "plugin"
+    evidence = tmp_path / "evidence"
+    _create_observer_plugin(plugin, evidence)
+
+    hooks = json.loads((plugin / "hooks" / "hooks.json").read_text())
+    assert set(hooks["hooks"]) == {"SessionStart", "SessionEnd", "Notification"}
+    assert OBSERVER_EVENT_MATCHERS == (
+        "SessionStart",
+        "SessionEnd",
+        "permission_prompt",
+        "idle_prompt",
+        "agent_needs_input",
+        "agent_completed",
+    )
+    serialized = json.dumps(hooks)
+    for forbidden in (
+        "PermissionRequest",
+        "PermissionDenied",
+        "PreToolUse",
+        "Stop",
+        "SubagentStop",
+        "WorktreeCreate",
+        "WorktreeRemove",
+        "decision",
+        "continue",
+    ):
+        assert forbidden not in serialized
+
+    observer = plugin / "hooks" / "observer.py"
+    completed = subprocess.run(
+        [sys.executable, str(observer), "SessionStart"],
+        input='{"prompt":"must not persist"}',
+        capture_output=True,
+        text=True,
+        check=False,
+        env={**os.environ, "CLAUDE_OBSERVER_EVIDENCE_DIR": str(evidence)},
+    )
+    assert completed.returncode == 0
+    assert completed.stdout == ""
+    assert completed.stderr == ""
+    stored = json.loads(next(evidence.glob("*.json")).read_text())
+    assert stored["event"] == "SessionStart"
+    assert stored["input_bytes"] > 0
+    assert "must not persist" not in json.dumps(stored)
+
+    unavailable = tmp_path / "not-a-directory"
+    unavailable.write_text("occupied")
+    unavailable_run = subprocess.run(
+        [sys.executable, str(observer), "SessionEnd"],
+        input="{}",
+        capture_output=True,
+        text=True,
+        check=False,
+        env={**os.environ, "CLAUDE_OBSERVER_EVIDENCE_DIR": str(unavailable)},
+    )
+    assert unavailable_run.returncode == 0
+    assert unavailable_run.stdout == ""
+    assert unavailable_run.stderr == ""
+
+
+def test_unattended_probe_uses_only_generated_owned_session_and_sanitizes_artifact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    artifact = tmp_path / "unattended-hooks.json"
+    calls: list[tuple[str, ...]] = []
+    evidence = tmp_path / "fake-evidence"
+    evidence.mkdir()
+    (evidence / "SessionStart.json").write_text('{"event":"SessionStart"}')
+
+    def fake_capability(capability: object) -> Path:
+        assert capability is marker
+        return Path(EXACT_CLAUDE_BIN)
+
+    def fake_owned_run(
+        binary: Path, argv: tuple[str, ...], cwd: Path
+    ) -> CommandCapture:
+        assert binary == Path(EXACT_CLAUDE_BIN)
+        assert cwd.name == "repository"
+        calls.append(argv)
+        if argv[1:3] == ("agents", "--json"):
+            return CommandCapture(argv, 0, "[]", "", False, None)
+        return CommandCapture(argv, 0, "", "", False, None)
+
+    marker = object()
+    monkeypatch.setattr(
+        "hermes_claude_sessions.characterization._require_exact_observer_capability",
+        fake_capability,
+    )
+    monkeypatch.setattr(
+        "hermes_claude_sessions.characterization._run_owned_observer_command",
+        fake_owned_run,
+    )
+    monkeypatch.setattr(
+        "hermes_claude_sessions.characterization._create_probe_evidence_directory",
+        lambda _: evidence,
+    )
+
+    result = collect_unattended_observer_hook_characterization(marker, artifact)
+
+    assert artifact.exists()
+    assert result["context"] == "unattended_bg"
+    assert result["fully_characterized"] is False
+    assert result["estimated_test_owned_session_count"] == 1
+    assert result["actual_test_owned_session_count"] == 1
+    assert result["cleanup"]["confirmed"] is True
+    assert any("--bg" in argv for argv in calls)
+    stop = next(argv for argv in calls if argv[1] == "stop")
+    assert stop[2].startswith("observer-")
+    assert all(
+        entry["status"] in {"observed", "not_observed", "probe_inconclusive"}
+        for entry in result["events"]
+    )
+    assert (
+        next(entry for entry in result["events"] if entry["event"] == "SessionStart")[
+            "status"
+        ]
+        == "observed"
+    )
+    written = artifact.read_text()
+    assert str(tmp_path) not in written
+    assert 'fully_characterized": true' not in written
+
+
+def test_unattended_fixture_is_schema_only_not_synthetic_live_evidence() -> None:
+    fixture = (
+        Path(__file__).parent
+        / "characterization"
+        / "unattended_observer_hooks.fixture.json"
+    )
+    payload = json.loads(fixture.read_text())
+    assert payload["source"] == "deterministic_schema_fixture_no_live_probe"
+    assert payload["fully_characterized"] is False
+    assert payload["raw_evidence_retained"] is False
+    assert {entry["status"] for entry in payload["events"]} == {"probe_inconclusive"}

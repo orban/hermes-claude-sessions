@@ -16,9 +16,11 @@ import re
 import selectors
 import signal
 import subprocess
+import sys
 import tempfile
 import threading
 import time
+import uuid
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, BinaryIO, cast
@@ -49,6 +51,19 @@ SAFE_COMMANDS: tuple[tuple[str, ...], ...] = (
     ("daemon", "status"),
     ("agents", "--json", "--all"),
 )
+EXACT_CLAUDE_BIN = "/Users/ryo/.local/bin/claude"
+OBSERVER_EVENT_MATCHERS = (
+    "SessionStart",
+    "SessionEnd",
+    "permission_prompt",
+    "idle_prompt",
+    "agent_needs_input",
+    "agent_completed",
+)
+OBSERVER_TIMEOUT_SECONDS = 10.0
+OBSERVER_SUITE_TIMEOUT_SECONDS = 40.0
+OBSERVER_EVIDENCE_LIMIT = 16
+OBSERVER_INPUT_LIMIT = 32_768
 
 
 class CharacterizationError(ValueError):
@@ -76,6 +91,16 @@ def _require_acknowledged_binary(capability: object) -> Path:
     if not isinstance(capability, AcknowledgedClaudeBinary):
         raise CharacterizationError("a validated Claude capability is required")
     return capability._binary
+
+
+def _require_exact_observer_capability(capability: object) -> Path:
+    """Narrow Task 0B to the explicitly approved executable, not any capability."""
+    binary = _require_acknowledged_binary(capability)
+    if str(binary) != EXACT_CLAUDE_BIN:
+        raise CharacterizationError(
+            f"CLAUDE_BIN must be exactly {EXACT_CLAUDE_BIN} for observer probing"
+        )
+    return binary
 
 
 @dataclasses.dataclass(frozen=True)
@@ -245,6 +270,7 @@ def _run_command(
     *,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     output_limit: int = MAX_OUTPUT_BYTES,
+    cwd: Path | None = None,
 ) -> CommandCapture:
     """Run argv privately with a deadline covering the child and both pipe EOFs."""
     if output_limit < 0:
@@ -257,6 +283,7 @@ def _run_command(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             start_new_session=os.name == "posix",
+            cwd=cwd,
         )
     except OSError as error:
         return CommandCapture(
@@ -530,3 +557,245 @@ def collect_live_contract(capability: AcknowledgedClaudeBinary) -> dict[str, Any
         "safe_command_suffixes": [list(command) for command in SAFE_COMMANDS],
     }
     return sanitize_contract(contract)
+
+
+def _observer_program() -> str:
+    """Return the deliberately silent, bounded, local-only hook observer program."""
+    return f"""import json
+import os
+import signal
+import sys
+import tempfile
+from pathlib import Path
+
+LIMIT = {OBSERVER_INPUT_LIMIT}
+signal.signal(signal.SIGALRM, lambda *_: (_ for _ in ()).throw(TimeoutError()))
+signal.alarm(5)
+try:
+    event = sys.argv[1]
+    payload = sys.stdin.buffer.read(LIMIT + 1)
+    record = {{
+        "event": event,
+        "input_bytes": min(len(payload), LIMIT),
+        "input_truncated": len(payload) > LIMIT,
+
+    }}
+    destination = Path(os.environ["CLAUDE_OBSERVER_EVIDENCE_DIR"])
+    destination.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", dir=destination, prefix="event-",
+        suffix=".json", delete=False,
+    ) as output:
+        json.dump(record, output, sort_keys=True, ensure_ascii=True)
+        output.flush()
+        os.fsync(output.fileno())
+except Exception:
+    pass
+finally:
+    signal.alarm(0)
+sys.exit(0)
+"""
+
+
+def _create_observer_plugin(plugin_directory: Path, evidence_directory: Path) -> None:
+    """Create a session-local observer-only plugin; never a production bundle."""
+    hooks_directory = plugin_directory / "hooks"
+    hooks_directory.mkdir(parents=True)
+    metadata_directory = plugin_directory / ".claude-plugin"
+    metadata_directory.mkdir()
+    (metadata_directory / "plugin.json").write_text(
+        json.dumps({"name": "observer-probe", "version": "0.0.0"}), encoding="utf-8"
+    )
+    observer = hooks_directory / "observer.py"
+    observer.write_text(_observer_program(), encoding="utf-8")
+    observer.chmod(0o700)
+    command_prefix = (
+        f"CLAUDE_OBSERVER_EVIDENCE_DIR={evidence_directory} {sys.executable} {observer}"
+    )
+    hooks: dict[str, list[dict[str, Any]]] = {
+        "SessionStart": [
+            {
+                "hooks": [
+                    {"type": "command", "command": f"{command_prefix} SessionStart"}
+                ]
+            }
+        ],
+        "SessionEnd": [
+            {"hooks": [{"type": "command", "command": f"{command_prefix} SessionEnd"}]}
+        ],
+        "Notification": [
+            {
+                "matcher": matcher,
+                "hooks": [
+                    {"type": "command", "command": f"{command_prefix} {matcher}"}
+                ],
+            }
+            for matcher in OBSERVER_EVENT_MATCHERS[2:]
+        ],
+    }
+    (hooks_directory / "hooks.json").write_text(
+        json.dumps({"hooks": hooks}, sort_keys=True), encoding="utf-8"
+    )
+
+
+def _create_probe_evidence_directory(root: Path) -> Path:
+    evidence = root / "evidence"
+    evidence.mkdir()
+    return evidence
+
+
+def _owned_session_id() -> str:
+    return f"observer-{uuid.uuid4()}"
+
+
+def _run_owned_observer_command(
+    binary: Path, argv: tuple[str, ...], cwd: Path
+) -> CommandCapture:
+    """Run only exact probe-owned argv shapes; this is intentionally private."""
+    if not argv or argv[0] != str(binary):
+        raise CharacterizationError("observer command must use the validated binary")
+    suffix = argv[1:]
+    is_listing = suffix == ("agents", "--json", "--all")
+    is_stop = (
+        len(suffix) == 2 and suffix[0] == "stop" and suffix[1].startswith("observer-")
+    )
+    is_launch = (
+        len(suffix) == 11
+        and suffix[0] == "--bg"
+        and suffix[1] == "--session-id"
+        and suffix[2].startswith("observer-")
+        and suffix[3] == "--name"
+        and suffix[4].startswith("observer-")
+        and suffix[5:7] == ("--permission-mode", "default")
+        and suffix[7] == "--plugin-dir"
+        and suffix[9] == "-p"
+        and suffix[10] == "observer hook characterization"
+    )
+    if not (is_listing or is_stop or is_launch):
+        raise CharacterizationError("observer command shape is not probe-owned")
+    return _run_command(argv, timeout_seconds=OBSERVER_TIMEOUT_SECONDS, cwd=cwd)
+
+
+def _event_rows(evidence_directory: Path) -> list[dict[str, Any]]:
+    observed: set[str] = set()
+    evidence_files = sorted(evidence_directory.glob("*.json"))[:OBSERVER_EVIDENCE_LIMIT]
+    for path in evidence_files:
+        try:
+            candidate = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if (
+            isinstance(candidate, Mapping)
+            and candidate.get("event") in OBSERVER_EVENT_MATCHERS
+        ):
+            observed.add(cast(str, candidate["event"]))
+    return [
+        {
+            "event": event,
+            "status": "observed" if event in observed else "probe_inconclusive",
+            "evidence": {
+                "metadata_records": len(evidence_files),
+                "raw_retained": False,
+            },
+        }
+        for event in OBSERVER_EVENT_MATCHERS
+    ]
+
+
+def collect_unattended_observer_hook_characterization(
+    capability: object, destination: Path
+) -> dict[str, Any]:
+    """Probe one fresh exact-owned ``--bg`` session with narrow cleanup."""
+    binary = _require_exact_observer_capability(capability)
+    session_id = _owned_session_id()
+    cleanup_capture: CommandCapture | None = None
+    after_capture: CommandCapture | None = None
+    with tempfile.TemporaryDirectory(prefix="claude-observer-") as temporary_name:
+        root = Path(temporary_name)
+        repository = root / "repository"
+        repository.mkdir()
+        initialized = _run_command(
+            ("git", "init", "--quiet"),
+            timeout_seconds=OBSERVER_TIMEOUT_SECONDS,
+            cwd=repository,
+        )
+        if initialized.returncode != 0 or initialized.timed_out:
+            raise CharacterizationError(
+                "failed to initialize fresh probe Git repository"
+            )
+        evidence = _create_probe_evidence_directory(root)
+        plugin = root / "plugin"
+        _create_observer_plugin(plugin, evidence)
+        launch_argv = (
+            str(binary),
+            "--bg",
+            "--session-id",
+            session_id,
+            "--name",
+            session_id,
+            "--permission-mode",
+            "default",
+            "--plugin-dir",
+            str(plugin),
+            "-p",
+            "observer hook characterization",
+        )
+        launch_capture = _run_owned_observer_command(binary, launch_argv, repository)
+        try:
+            cleanup_capture = _run_owned_observer_command(
+                binary, (str(binary), "stop", session_id), repository
+            )
+            after_capture = _run_owned_observer_command(
+                binary, (str(binary), "agents", "--json", "--all"), repository
+            )
+            try:
+                remaining = json.loads(after_capture.stdout)
+                cleanup_confirmed = (
+                    cleanup_capture.returncode == 0
+                    and not cleanup_capture.timed_out
+                    and isinstance(remaining, list)
+                    and all(
+                        item.get("id") != session_id
+                        for item in remaining
+                        if isinstance(item, Mapping)
+                    )
+                )
+            except json.JSONDecodeError:
+                cleanup_confirmed = False
+        finally:
+            # No broad cleanup: the sole generated ID is the sole target.
+            pass
+        result: dict[str, Any] = {
+            "schema_version": 1,
+            "context": "unattended_bg",
+            "fully_characterized": False,
+            "manual_gates_deferred": ["permission", "lifecycle", "worktree"],
+            "estimated_test_owned_session_count": 1,
+            "actual_test_owned_session_count": int(
+                launch_capture.returncode == 0
+                and not launch_capture.timed_out
+                and launch_capture.error is None
+            ),
+            "events": _event_rows(evidence),
+            "cleanup": {
+                "owned_session_id": session_id,
+                "confirmed": cleanup_confirmed,
+                "stop_returncode": cleanup_capture.returncode
+                if cleanup_capture
+                else None,
+                "post_cleanup_listing_returncode": after_capture.returncode
+                if after_capture
+                else None,
+            },
+            "launch": {
+                "returncode": launch_capture.returncode,
+                "timed_out": launch_capture.timed_out,
+                "error": launch_capture.error,
+            },
+        }
+        atomic_write_contract(destination, result)
+        if not cleanup_confirmed:
+            raise CharacterizationError(
+                f"cleanup could not be confirmed for exact owned session {session_id}"
+            )
+        return sanitize_contract(result)
