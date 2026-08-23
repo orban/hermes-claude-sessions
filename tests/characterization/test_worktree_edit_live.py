@@ -40,4 +40,9 @@ def test_disposable_accept_edits_worktree_characterization(tmp_path: Path) -> No
     assert result["cleanup"]["confirmed"] is True
     assert result["unrelated_agents"]["unchanged"] is True
     assert result["worktree"]["primary_unchanged"] is True
+    assert result["worktree"]["probe_status"] in {
+        "observed",
+        "not_observed",
+        "probe_inconclusive",
+    }
     assert '"rm"' not in artifact.read_text(encoding="utf-8")

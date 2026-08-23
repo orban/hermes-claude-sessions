@@ -1236,12 +1236,12 @@ class _WorktreeProbe:
     """One exact-owned disposable edit probe; never a public command target."""
 
     display_name: str
-    session_id: str
+    session_id: str | None = None
     display_id: str | None = None
 
 
 def _mint_worktree_probe() -> _WorktreeProbe:
-    return _WorktreeProbe(f"worktree-edit-{uuid.uuid4()}", str(uuid.uuid4()))
+    return _WorktreeProbe(f"worktree-edit-{uuid.uuid4()}")
 
 
 def _worktree_prompt() -> str:
@@ -1365,6 +1365,14 @@ def _worktree_paths(porcelain: str) -> dict[str, str | None]:
     return entries
 
 
+def _preserve_worktree_diagnostics(root: Path) -> Path:
+    """Move one exact temporary probe root aside when safe cleanup is unproven."""
+    directory = tempfile.mkdtemp(prefix="claude-worktree-diagnostics-")
+    destination = Path(directory) / "probe"
+    os.replace(root, destination)
+    return destination
+
+
 def _discover_worktree_identity(
     binary: Path,
     probe: _WorktreeProbe,
@@ -1384,7 +1392,11 @@ def _discover_worktree_identity(
             try:
                 matches = _owned_rows(
                     json.loads(listing.stdout),
-                    _OwnedProbe(probe.display_name, "worktree"),
+                    _OwnedProbe(
+                        probe.display_name,
+                        "worktree",
+                        display_id=probe.display_id,
+                    ),
                 )
             except json.JSONDecodeError:
                 matches = []
@@ -1402,6 +1414,7 @@ def _discover_worktree_identity(
                     and isinstance(full, str)
                     and isinstance(short, str)
                     and full not in preexisting
+                    and short == probe.display_id
                     and full[:8] == short
                 ):
                     return dataclasses.replace(probe, session_id=full, display_id=short)
@@ -1478,51 +1491,101 @@ def _observe_worktree_probe(
     evidence_directory: Path,
     deadline: float,
 ) -> dict[str, Any]:
-    """Bounded read-only artifact observation; it never removes a worktree."""
+    """Poll native completion and bounded artifacts; never remove a worktree."""
     deadline = min(deadline, time.monotonic() + WORKTREE_TIMEOUT_SECONDS)
-    after_worktrees = _worktree_snapshot(repository, deadline)
-    before_paths, after_paths = (
-        _worktree_paths(before_worktrees),
-        _worktree_paths(after_worktrees),
-    )
-    created = {
-        path: branch for path, branch in after_paths.items() if path not in before_paths
-    }
-    if len(created) > 1:
-        raise CharacterizationError("ambiguous created worktree paths")
-    worktree_path, branch = next(iter(created.items()), (None, None))
-    effective = Path(worktree_path) if worktree_path is not None else None
-    requested_edit_landed = False
-    diff = ""
-    if effective is not None and effective.is_dir():
-        seed = effective / "seed.txt"
-        requested_edit_landed = (
-            seed.read_text(encoding="utf-8") == "seed\nCHARACTERIZATION_EDIT\n"
-            if seed.exists()
-            else False
+    before_paths = _worktree_paths(before_worktrees)
+    latest: dict[str, Any] = {}
+    native_terminal = False
+    while _remaining(deadline) > 0:
+        listing = _run_owned_worktree_command(
+            binary,
+            probe,
+            (str(binary), "agents", "--json", "--all"),
+            repository,
+            min(WORKTREE_TIMEOUT_SECONDS, _remaining(deadline)),
         )
-        capture = _run_git(("git", "diff", "--", "seed.txt"), effective, deadline)
-        _require_git_success(capture, "diff")
-        diff = capture.stdout[:WORKTREE_DIFF_LIMIT]
-    primary_unchanged = (repository / "seed.txt").read_text(
-        encoding="utf-8"
-    ) == "seed\n"
-    hook_cwds = _evidence_cwds(evidence_directory)
-    hook_effective = worktree_path if worktree_path in hook_cwds else None
-    return {
-        "separate_worktree_created": worktree_path is not None,
-        "worktree_path": worktree_path,
-        "git_branch": branch,
-        "effective_cwd": hook_effective or worktree_path,
-        "effective_cwd_source": "hook"
-        if hook_effective is not None
-        else "git_worktree"
-        if worktree_path is not None
-        else "inconclusive",
-        "requested_edit_landed": requested_edit_landed,
-        "primary_unchanged": primary_unchanged,
-        "diff": diff,
-    }
+        if listing.returncode != 0 or listing.timed_out:
+            time.sleep(min(0.2, _remaining(deadline)))
+            continue
+        try:
+            matches = _owned_rows(
+                json.loads(listing.stdout),
+                _OwnedProbe(
+                    probe.display_name,
+                    "worktree",
+                    probe.session_id,
+                    probe.display_id,
+                ),
+            )
+        except json.JSONDecodeError:
+            matches = []
+        if len(matches) > 1:
+            raise CharacterizationError("ambiguous worktree probe during observation")
+        after_worktrees = _worktree_snapshot(repository, deadline)
+        after_paths = _worktree_paths(after_worktrees)
+        created = {
+            path: branch
+            for path, branch in after_paths.items()
+            if path not in before_paths
+        }
+        if len(created) > 1:
+            raise CharacterizationError("ambiguous created worktree paths")
+        worktree_path, branch = next(iter(created.items()), (None, None))
+        effective = Path(worktree_path) if worktree_path is not None else None
+        requested_edit_landed = False
+        diff = ""
+        if effective is not None and effective.is_dir():
+            seed = effective / "seed.txt"
+            requested_edit_landed = (
+                seed.read_text(encoding="utf-8") == "seed\nCHARACTERIZATION_EDIT\n"
+                if seed.exists()
+                else False
+            )
+            capture = _run_git(("git", "diff", "--", "seed.txt"), effective, deadline)
+            _require_git_success(capture, "diff")
+            diff = capture.stdout[:WORKTREE_DIFF_LIMIT]
+        primary_unchanged = (repository / "seed.txt").read_text(
+            encoding="utf-8"
+        ) == "seed\n"
+        hook_cwds = _evidence_cwds(evidence_directory)
+        hook_effective = worktree_path if worktree_path in hook_cwds else None
+        state = matches[0].get("state") if len(matches) == 1 else None
+        native_terminal = state in {"completed", "failed", "stopped"}
+        observed_events = sorted(_read_evidence(evidence_directory))
+        if state == "completed" and worktree_path is not None and requested_edit_landed:
+            probe_status = "observed"
+        elif state == "completed":
+            probe_status = "not_observed"
+        else:
+            probe_status = "probe_inconclusive"
+        latest = {
+            "probe_status": probe_status,
+            "separate_worktree_created": worktree_path is not None,
+            "worktree_path": worktree_path,
+            "git_branch": branch,
+            "effective_cwd": hook_effective or worktree_path,
+            "effective_cwd_source": "hook"
+            if hook_effective is not None
+            else "git_worktree"
+            if worktree_path is not None
+            else "inconclusive",
+            "requested_edit_landed": requested_edit_landed,
+            "primary_unchanged": primary_unchanged,
+            "native_state_before_cleanup": state,
+            "native_terminal_observed": native_terminal,
+            "observer_events": observed_events,
+            "blocked_before_cleanup": state == "blocked",
+            "permission_notification_observed": "permission_prompt" in observed_events,
+            "diff": diff,
+        }
+        if native_terminal:
+            return latest
+        time.sleep(min(0.2, _remaining(deadline)))
+    if latest:
+        return latest
+    raise CharacterizationError(
+        "worktree observation produced no valid native snapshot"
+    )
 
 
 def collect_disposable_worktree_edit_characterization(
@@ -1563,7 +1626,11 @@ def collect_disposable_worktree_edit_characterization(
             launch.stdout, _OwnedProbe(probe.display_name, "worktree")
         )
         if token is None:
-            raise CharacterizationError("worktree launch omitted exact cleanup token")
+            diagnostics = _preserve_worktree_diagnostics(root)
+            raise CharacterizationError(
+                "worktree launch omitted exact cleanup token; diagnostics preserved at "
+                f"{diagnostics}"
+            )
         probe = dataclasses.replace(probe, display_id=token)
         observation: dict[str, Any] = {}
         cleanup_confirmed = False
@@ -1596,6 +1663,32 @@ def collect_disposable_worktree_edit_characterization(
                 repository,
                 min(deadline, time.monotonic() + WORKTREE_CLEANUP_SECONDS),
             )
+        stop_preserved_artifact = False
+        stop_preserved_worktree = False
+        primary_unchanged_after_stop = False
+        if cleanup_confirmed:
+            try:
+                post_stop_worktrees = _worktree_paths(
+                    _worktree_snapshot(repository, deadline)
+                )
+                created_path = observation.get("worktree_path")
+                if (
+                    isinstance(created_path, str)
+                    and created_path in post_stop_worktrees
+                ):
+                    stop_preserved_worktree = True
+                    seed = Path(created_path) / "seed.txt"
+                    stop_preserved_artifact = (
+                        seed.exists()
+                        and seed.read_text(encoding="utf-8")
+                        == "seed\nCHARACTERIZATION_EDIT\n"
+                    )
+                primary_unchanged_after_stop = (repository / "seed.txt").read_text(
+                    encoding="utf-8"
+                ) == "seed\n"
+            except Exception as caught:
+                if error is None:
+                    error = caught
         after_agents = _snapshot_agents(
             _run_owned_worktree_command(
                 binary,
@@ -1614,21 +1707,36 @@ def collect_disposable_worktree_edit_characterization(
             }
             == before_agents
         )
+        diagnostics_preserved = False
+        diagnostics_path: Path | None = None
+        if not cleanup_confirmed:
+            diagnostics_path = _preserve_worktree_diagnostics(root)
+            diagnostics_preserved = True
         result: dict[str, Any] = {
             "schema_version": 1,
             "context": "unattended_bg_disposable_worktree",
             "fully_characterized": False,
             "estimated_test_owned_session_count": 1,
-            "actual_test_owned_session_count": 1,
+            "actual_test_owned_session_count": int(
+                probe.display_id is not None and probe.session_id is not None
+            ),
             "launch_token_reconciled": probe.display_id is not None
+            and probe.session_id is not None
             and probe.session_id not in before_agents,
+            "launch_invoked_from_origin_cwd": True,
+            "origin_cwd": str(repository),
             "cleanup": {"confirmed": cleanup_confirmed},
+            "diagnostics_preserved": diagnostics_preserved,
             "unrelated_agents": {
                 "pre_existing_count": len(before_agents),
                 "unchanged": unrelated_unchanged,
             },
-            "stop_preserved_artifact": observation.get("worktree_path") is not None,
-            "worktree": observation,
+            "stop_preserved_artifact": stop_preserved_artifact,
+            "stop_preserved_worktree": stop_preserved_worktree,
+            "worktree": {
+                **observation,
+                "primary_unchanged_after_stop": primary_unchanged_after_stop,
+            },
         }
         atomic_write_contract(destination, result)
         if error is not None:
@@ -1638,7 +1746,10 @@ def collect_disposable_worktree_edit_characterization(
                 f"worktree observation failed: {type(error).__name__}"
             ) from error
         if not cleanup_confirmed:
-            raise CharacterizationError("worktree cleanup could not be confirmed")
+            raise CharacterizationError(
+                "worktree cleanup could not be confirmed; diagnostics preserved at "
+                f"{diagnostics_path}"
+            )
         if not unrelated_unchanged:
             raise CharacterizationError(
                 "pre-existing unrelated agent states changed during worktree probe"

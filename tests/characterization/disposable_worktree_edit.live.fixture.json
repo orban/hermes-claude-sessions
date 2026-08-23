@@ -1,0 +1,40 @@
+{
+  "actual_test_owned_session_count": 1,
+  "cleanup": {
+    "confirmed": true
+  },
+  "context": "unattended_bg_disposable_worktree",
+  "diagnostics_preserved": false,
+  "estimated_test_owned_session_count": 1,
+  "fingerprint": "c57584e161c83fb0fa187f6c0f21f761ac6654c79ba56eecf398d88797883de4",
+  "fully_characterized": false,
+  "launch_invoked_from_origin_cwd": true,
+  "launch_token_reconciled": true,
+  "origin_cwd": "<TEMP_PATH>",
+  "schema_version": 1,
+  "stop_preserved_artifact": false,
+  "stop_preserved_worktree": false,
+  "unrelated_agents": {
+    "pre_existing_count": 56,
+    "unchanged": true
+  },
+  "worktree": {
+    "blocked_before_cleanup": true,
+    "diff": "",
+    "effective_cwd": null,
+    "effective_cwd_source": "inconclusive",
+    "git_branch": null,
+    "native_state_before_cleanup": "blocked",
+    "native_terminal_observed": false,
+    "observer_events": [
+      "SessionStart"
+    ],
+    "permission_notification_observed": false,
+    "primary_unchanged": true,
+    "primary_unchanged_after_stop": true,
+    "probe_status": "probe_inconclusive",
+    "requested_edit_landed": false,
+    "separate_worktree_created": false,
+    "worktree_path": null
+  }
+}

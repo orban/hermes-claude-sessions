@@ -69,4 +69,9 @@ temporary teardown, the probe atomically persists only a bounded sanitized diff
 and metadata, then compares all pre-existing native identity/state rows. It
 reports characteristics such as isolation, edit location, primary-checkout
 integrity, and post-stop artifact preservation without claiming full
-characterization.
+characterization. The sanitized live fixture records the current probe as
+`probe_inconclusive`: the exact owned session reached native `blocked`, only
+`SessionStart` was observed, no permission notification was observed, and no
+worktree or edit existed before exact cleanup. This is not evidence that
+background worktrees are unsupported; the manual permission/lifecycle matrix
+must resolve why the unattended probe blocked.
