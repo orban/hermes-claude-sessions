@@ -865,6 +865,12 @@ def test_unattended_fixture_is_schema_only_not_synthetic_live_evidence() -> None
     )
     payload = json.loads(fixture.read_text())
     assert payload["source"] == "deterministic_schema_fixture_no_live_probe"
+    assert payload["estimated_test_owned_session_count"] == len(
+        OBSERVER_EVENT_MATCHERS[2:]
+    )
+    assert [entry["event"] for entry in payload["events"]] == list(
+        OBSERVER_EVENT_MATCHERS
+    )
     assert payload["fully_characterized"] is False
     assert payload["raw_evidence_retained"] is False
     assert {entry["status"] for entry in payload["events"]} == {"probe_inconclusive"}

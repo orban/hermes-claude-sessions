@@ -1,6 +1,6 @@
 {
   "context": "unattended_bg",
-  "estimated_test_owned_session_count": 1,
+  "estimated_test_owned_session_count": 4,
   "events": [
     {"event": "SessionStart", "status": "probe_inconclusive"},
     {"event": "SessionEnd", "status": "probe_inconclusive"},
