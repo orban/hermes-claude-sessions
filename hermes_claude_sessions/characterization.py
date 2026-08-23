@@ -227,6 +227,11 @@ def _capture_posix_until_deadline(
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return returncode, direct_child_reaped, True
+            if not selector.get_map():
+                try:
+                    return process.wait(timeout=remaining), True, False
+                except subprocess.TimeoutExpired:
+                    return None, False, True
             for key, _ in selector.select(remaining):
                 destination = cast(bytearray, key.data)
                 if _drain_nonblocking(key.fd, destination, output_limit):
@@ -287,18 +292,29 @@ def _run_command(
     argv: Sequence[str],
     *,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+    overall_timeout_seconds: float | None = None,
     output_limit: int = MAX_OUTPUT_BYTES,
     cwd: Path | None = None,
 ) -> CommandCapture:
-    """Run argv privately with a deadline covering the child and both pipe EOFs."""
+    """Run argv with a full execution allowance and a bounded overall deadline."""
     if output_limit < 0:
         raise ValueError("output_limit must not be negative")
     if timeout_seconds < 0:
         raise ValueError("timeout_seconds must not be negative")
+    if (
+        overall_timeout_seconds is not None
+        and overall_timeout_seconds < timeout_seconds
+    ):
+        raise ValueError("overall_timeout_seconds must cover timeout_seconds")
     normalized_argv = tuple(argv)
-    hard_deadline = time.monotonic() + timeout_seconds
-    termination_reserve = min(TERMINATION_GRACE_SECONDS, timeout_seconds / 2)
-    capture_deadline = hard_deadline - termination_reserve
+    started_at = time.monotonic()
+    capture_deadline = started_at + timeout_seconds
+    total_allowance = (
+        timeout_seconds + TERMINATION_GRACE_SECONDS
+        if overall_timeout_seconds is None
+        else overall_timeout_seconds
+    )
+    hard_deadline = started_at + total_allowance
     try:
         process = subprocess.Popen(
             normalized_argv,
@@ -349,6 +365,26 @@ def _run_command(
         _decode_bounded(bytes(stderr)),
         timed_out,
         None,
+    )
+
+
+def _run_command_within_total_budget(
+    argv: Sequence[str],
+    *,
+    total_timeout_seconds: float,
+    output_limit: int = MAX_OUTPUT_BYTES,
+    cwd: Path | None = None,
+) -> CommandCapture:
+    """Run under a hard total budget, explicitly reserving bounded teardown time."""
+    if total_timeout_seconds < 0:
+        raise ValueError("total_timeout_seconds must not be negative")
+    teardown_reserve = min(TERMINATION_GRACE_SECONDS, total_timeout_seconds / 2)
+    return _run_command(
+        argv,
+        timeout_seconds=total_timeout_seconds - teardown_reserve,
+        overall_timeout_seconds=total_timeout_seconds,
+        output_limit=output_limit,
+        cwd=cwd,
     )
 
 
@@ -752,7 +788,9 @@ def _run_owned_observer_command(
     )
     if not (is_listing or is_stop or is_launch):
         raise CharacterizationError("observer command shape is not probe-owned")
-    return _run_command(argv, timeout_seconds=timeout, cwd=cwd)
+    return _run_command_within_total_budget(
+        argv, total_timeout_seconds=timeout, cwd=cwd
+    )
 
 
 def _read_evidence(evidence_directory: Path) -> set[str]:
@@ -983,9 +1021,9 @@ def collect_unattended_observer_hook_characterization(
         root = Path(temporary_name)
         repository = root / "repository"
         repository.mkdir()
-        initialized = _run_command(
+        initialized = _run_command_within_total_budget(
             ("git", "init", "--quiet"),
-            timeout_seconds=min(OBSERVER_TIMEOUT_SECONDS, _remaining(deadline)),
+            total_timeout_seconds=min(OBSERVER_TIMEOUT_SECONDS, _remaining(deadline)),
             cwd=repository,
         )
         if initialized.returncode != 0 or initialized.timed_out:

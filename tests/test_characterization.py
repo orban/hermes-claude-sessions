@@ -119,9 +119,25 @@ def test_private_runner_captures_timeout_and_os_error() -> None:
     assert "definitely/not/a/command" in missing.error
 
 
+def test_private_runner_allows_success_through_full_execution_timeout() -> None:
+    timeout_seconds = 2.0
+    started = time.monotonic()
+    capture = _run_command(
+        [sys.executable, "-c", "import time; time.sleep(1.2); print('done')"],
+        timeout_seconds=timeout_seconds,
+    )
+    elapsed = time.monotonic() - started
+
+    assert capture.timed_out is False
+    assert capture.returncode == 0
+    assert capture.stdout.strip() == "done"
+    assert 1.0 <= elapsed < timeout_seconds
+
+
 @pytest.mark.skipif(os.name != "posix", reason="signal behavior is POSIX-specific")
-def test_private_runner_timeout_is_a_hard_wall_clock_budget() -> None:
-    timeout_seconds = 0.1
+def test_private_runner_explicit_overall_timeout_is_a_hard_wall_clock_budget() -> None:
+    timeout_seconds = 0.05
+    overall_timeout_seconds = 0.1
     started = time.monotonic()
     capture = _run_command(
         [
@@ -134,11 +150,21 @@ def test_private_runner_timeout_is_a_hard_wall_clock_budget() -> None:
             ),
         ],
         timeout_seconds=timeout_seconds,
+        overall_timeout_seconds=overall_timeout_seconds,
     )
     elapsed = time.monotonic() - started
 
     assert capture.timed_out is True
     assert elapsed < 0.4
+
+
+def test_private_runner_rejects_overall_timeout_shorter_than_execution() -> None:
+    with pytest.raises(ValueError, match="must cover timeout_seconds"):
+        _run_command(
+            [sys.executable, "-c", "pass"],
+            timeout_seconds=1,
+            overall_timeout_seconds=0.5,
+        )
 
 
 @pytest.mark.skipif(
@@ -1083,8 +1109,8 @@ def test_post_launch_identity_timeout_preserves_cleanup_reserve(
         fake_run,
     )
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._run_command",
-        lambda argv, timeout_seconds, cwd=None: CommandCapture(
+        "hermes_claude_sessions.characterization._run_command_within_total_budget",
+        lambda argv, total_timeout_seconds, cwd=None: CommandCapture(
             tuple(argv), 0, "", "", False, None
         ),
     )
@@ -1172,7 +1198,8 @@ def test_hard_command_deadlines_leave_time_for_all_exact_observer_cleanup(
                     "time.sleep(30)"
                 ),
             ],
-            timeout_seconds=0.1,
+            timeout_seconds=0.05,
+            overall_timeout_seconds=0.1,
         )
         assert capture.timed_out is True
         return True, False, set()
