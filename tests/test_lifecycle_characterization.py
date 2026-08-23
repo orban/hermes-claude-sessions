@@ -16,6 +16,7 @@ from hermes_claude_sessions.characterization import (
     _classify_lifecycle_roster,
     _lifecycle_cleanup,
     _lifecycle_launch_argv,
+    _lifecycle_roster_snapshot,
     _LifecycleProbe,
     _run_owned_lifecycle_command,
     collect_unattended_lifecycle_characterization,
@@ -99,6 +100,32 @@ def test_lifecycle_roster_classifier_is_evidence_bounded(
     assert _classify_lifecycle_roster(rows) == expected
 
 
+@pytest.mark.parametrize(
+    "payload", ["null", "{}", '"text"', '[{"state":"running"}, 1]']
+)
+def test_lifecycle_roster_snapshot_rejects_malformed_json_structures(
+    payload: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    probe = _LifecycleProbe("lifecycle-test", "deadbeef")
+    monkeypatch.setattr(
+        "hermes_claude_sessions.characterization._lifecycle_listing",
+        lambda *args: CommandCapture(
+            (EXACT_CLAUDE_BIN, "agents", "--json", "--all"),
+            0,
+            payload,
+            "",
+            False,
+            None,
+        ),
+    )
+    assert (
+        _lifecycle_roster_snapshot(
+            Path(EXACT_CLAUDE_BIN), probe, tmp_path, time.monotonic() + 1
+        )
+        == "ambiguous"
+    )
+
+
 def test_lifecycle_probe_reconciles_exact_identity_exercises_identifiers_and_cleans(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -155,8 +182,15 @@ def test_lifecycle_probe_reconciles_exact_identity_exercises_identifiers_and_cle
             return CommandCapture(argv, 0, "2.1.239 (Claude Code)", "", False, None)
         target = argv[2]
         row = next(
-            item for item in rows.values() if target in {item["id"], item["sessionId"]}
+            (
+                item
+                for item in rows.values()
+                if target in {item["id"], item["sessionId"]}
+            ),
+            None,
         )
+        if row is None:
+            return CommandCapture(argv, 1, "", "not found", False, None)
         if argv[1] == "stop":
             row["state"] = "stopped"
         elif argv[1] == "respawn":
@@ -248,7 +282,7 @@ def test_lifecycle_archive_precedes_finally_cleanup_and_cleanup_runs_after_error
     )
     with pytest.raises(CharacterizationError, match="background launch failed"):
         collect_unattended_lifecycle_characterization(object(), tmp_path / "out.json")
-    assert events == ["archive", "archive"]
+    assert events == ["archive", "archive", "archive"]
 
 
 def test_each_exploratory_mutation_is_archived_before_execution(
@@ -291,6 +325,8 @@ def test_each_exploratory_mutation_is_archived_before_execution(
     def run(*args: object) -> CommandCapture:
         argv = args[2]
         assert isinstance(argv, tuple)
+        if argv[1] == "--bg":
+            events.append("run:launch:bg")
         if argv[1] in {"stop", "respawn"}:
             events.append(
                 f"run:{argv[1]}:{'short' if argv[2] == 'deadbeef' else 'full_uuid'}"
@@ -306,7 +342,7 @@ def test_each_exploratory_mutation_is_archived_before_execution(
                     }
                 ]
             )
-        elif argv[1] == "--bg":
+        elif argv[1] in {"--bg", "respawn"}:
             stdout = f"backgrounded · deadbeef · {probe.display_name}\n"
         elif argv[1] == "--version":
             stdout = "2.1.241 (Claude Code)"
@@ -320,12 +356,101 @@ def test_each_exploratory_mutation_is_archived_before_execution(
     collect_unattended_lifecycle_characterization(object(), tmp_path / "out.json")
 
     for mutation in (
+        "launch:bg",
         "stop:short",
         "respawn:short",
         "stop:full_uuid",
         "respawn:full_uuid",
     ):
         assert events.index(f"archive:{mutation}") < events.index(f"run:{mutation}")
+
+
+@pytest.mark.parametrize("accepted_spelling", ["short", "full_uuid"])
+def test_missing_respawn_token_recovers_exact_replacement_for_cleanup(
+    accepted_spelling: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    old_full = "11111111-1111-4111-8111-111111111111"
+    new_full = "22222222-2222-4222-8222-222222222222"
+    minted = _LifecycleProbe("lifecycle-test")
+    current = {
+        "id": "11111111",
+        "sessionId": old_full,
+        "name": minted.display_name,
+        "state": "running",
+    }
+    launched = False
+    replacement_created = False
+    stop_targets: list[str] = []
+
+    monkeypatch.setattr(
+        "hermes_claude_sessions.characterization._require_exact_observer_capability",
+        lambda _: Path(EXACT_CLAUDE_BIN),
+    )
+    monkeypatch.setattr(
+        "hermes_claude_sessions.characterization._initialize_seed_repository",
+        lambda *args: None,
+    )
+    monkeypatch.setattr(
+        "hermes_claude_sessions.characterization._mint_lifecycle_probe", lambda: minted
+    )
+    monkeypatch.setattr(
+        "hermes_claude_sessions.characterization._transition_to_terminal",
+        lambda *args: "observed",
+    )
+
+    def run(*args: object) -> CommandCapture:
+        nonlocal launched, replacement_created, current
+        argv = args[2]
+        assert isinstance(argv, tuple)
+        if argv[1] == "--version":
+            return CommandCapture(argv, 0, "2.1.241 (Claude Code)", "", False, None)
+        if argv[1] == "daemon":
+            return CommandCapture(argv, 0, "Daemon is running", "", False, None)
+        if argv[1] == "--bg":
+            launched = True
+            return CommandCapture(
+                argv,
+                0,
+                f"backgrounded · 11111111 · {minted.display_name}\n",
+                "",
+                False,
+                None,
+            )
+        if argv[1] == "agents":
+            rows = [current] if launched else []
+            return CommandCapture(argv, 0, json.dumps(rows), "", False, None)
+        if argv[1] == "logs":
+            return CommandCapture(argv, 0, "", "", False, None)
+        if argv[1] == "stop":
+            stop_targets.append(argv[2])
+            if argv[2] in {current["id"], current["sessionId"]}:
+                current["state"] = "stopped"
+            return CommandCapture(argv, 0, "", "", False, None)
+        if argv[1] == "respawn":
+            spelling = "short" if argv[2] == current["id"] else "full_uuid"
+            if replacement_created or spelling != accepted_spelling:
+                return CommandCapture(argv, 1, "", "", False, None)
+            replacement_created = True
+            current = {
+                "id": "22222222",
+                "sessionId": new_full,
+                "name": minted.display_name,
+                "state": "running",
+            }
+            return CommandCapture(
+                argv, 0, "respawn accepted without token\n", "", False, None
+            )
+        raise AssertionError(argv)
+
+    monkeypatch.setattr(
+        "hermes_claude_sessions.characterization._run_owned_lifecycle_command", run
+    )
+    result = collect_unattended_lifecycle_characterization(
+        object(), tmp_path / "out.json"
+    )
+    assert result["cleanup"]["confirmed"] is True
+    assert replacement_created
+    assert "22222222" in stop_targets
 
 
 def test_new_respawn_token_is_the_final_cleanup_capability_on_ambiguity(
@@ -422,7 +547,7 @@ def test_new_respawn_token_is_the_final_cleanup_capability_on_ambiguity(
         CharacterizationError, match="ambiguous lifecycle native identity"
     ):
         collect_unattended_lifecycle_characterization(object(), tmp_path / "out.json")
-    assert stop_targets[-1] == "22222222"
+    assert "22222222" in stop_targets
 
 
 @pytest.mark.parametrize(

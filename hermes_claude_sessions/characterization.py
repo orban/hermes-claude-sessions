@@ -2015,9 +2015,14 @@ def _lifecycle_roster_snapshot(
     if capture.returncode != 0 or capture.timed_out or capture.error:
         return "ambiguous"
     try:
-        rows = _owned_rows(json.loads(capture.stdout), _lifecycle_owned(probe))
+        payload = json.loads(capture.stdout)
     except json.JSONDecodeError:
         return "ambiguous"
+    if not isinstance(payload, list) or not all(
+        isinstance(row, Mapping) for row in payload
+    ):
+        return "ambiguous"
+    rows = _owned_rows(payload, _lifecycle_owned(probe))
     return _classify_lifecycle_roster(rows)
 
 
@@ -2108,6 +2113,61 @@ def _reconcile_lifecycle_identity(
                     and full not in excluded
                 ):
                     return dataclasses.replace(probe, session_id=full)
+        time.sleep(min(LIFECYCLE_POLL_SECONDS, _remaining(deadline)))
+    return None
+
+
+def _recover_lifecycle_identity_by_name(
+    binary: Path,
+    probe: _LifecycleProbe,
+    cwd: Path,
+    excluded: set[str],
+    deadline: float,
+) -> _LifecycleProbe | None:
+    """Recover one canonical exact-name identity after tokenless respawn output."""
+    while _remaining(deadline) > 0:
+        capture = _lifecycle_listing(
+            binary, probe, cwd, min(LIFECYCLE_TIMEOUT_SECONDS, _remaining(deadline))
+        )
+        if capture.returncode == 0 and not capture.timed_out and not capture.error:
+            try:
+                payload = json.loads(capture.stdout)
+            except json.JSONDecodeError:
+                payload = None
+            if isinstance(payload, list) and all(
+                isinstance(row, Mapping) for row in payload
+            ):
+                matches = [
+                    row for row in payload if row.get("name") == probe.display_name
+                ]
+                if len(matches) > 1:
+                    raise CharacterizationError(
+                        "ambiguous lifecycle identity after tokenless respawn"
+                    )
+                if len(matches) == 1:
+                    full, short = matches[0].get("sessionId"), matches[0].get("id")
+                    try:
+                        canonical = (
+                            isinstance(full, str) and str(uuid.UUID(full)) == full
+                        )
+                    except ValueError:
+                        canonical = False
+                    if not (
+                        canonical
+                        and isinstance(full, str)
+                        and isinstance(short, str)
+                        and re.fullmatch(r"[0-9a-f]{8}", short)
+                        and full[:8] == short
+                        and full not in excluded
+                    ):
+                        raise CharacterizationError(
+                            "malformed lifecycle identity after tokenless respawn"
+                        )
+                    return dataclasses.replace(probe, display_id=short, session_id=full)
+            elif payload is not None:
+                raise CharacterizationError(
+                    "malformed lifecycle roster after tokenless respawn"
+                )
         time.sleep(min(LIFECYCLE_POLL_SECONDS, _remaining(deadline)))
     return None
 
@@ -2288,8 +2348,10 @@ def collect_unattended_lifecycle_characterization(
             )
 
         launched = identity_reconciled = cleanup_confirmed = False
+        cleanup_probes: dict[str, _LifecycleProbe] = {}
         error: Exception | None = None
         try:
+            archive_before("launch", "bg")
             launch = _run_owned_lifecycle_command(
                 binary,
                 probe,
@@ -2305,12 +2367,14 @@ def collect_unattended_lifecycle_characterization(
                     "lifecycle launch omitted exact cleanup token"
                 )
             launched, probe = True, dataclasses.replace(probe, display_id=token)
+            cleanup_probes[token] = probe
             reconciled = _reconcile_lifecycle_identity(
                 binary, probe, repository, set(before), work_deadline
             )
             if reconciled is None:
                 raise CharacterizationError("lifecycle identity read-back failed")
             probe = reconciled
+            cleanup_probes[token] = probe
             identity_reconciled = True
             daemon["after_launch"] = _daemon_snapshot(
                 binary, probe, repository, work_deadline
@@ -2361,9 +2425,18 @@ def collect_unattended_lifecycle_characterization(
                 candidate = (
                     dataclasses.replace(probe, display_id=token, session_id=None)
                     if token is not None
-                    else probe
+                    else _recover_lifecycle_identity_by_name(
+                        binary, probe, repository, set(before), work_deadline
+                    )
                 )
+                if candidate is None:
+                    acceptance["respawn"]["short"] = "probe_inconclusive"
+                    raise CharacterizationError(
+                        "tokenless respawn identity recovery failed"
+                    )
                 probe = candidate
+                assert probe.display_id is not None
+                cleanup_probes[probe.display_id] = probe
                 respawned = _reconcile_lifecycle_identity(
                     binary, candidate, repository, set(), work_deadline
                 )
@@ -2410,9 +2483,18 @@ def collect_unattended_lifecycle_characterization(
                 candidate = (
                     dataclasses.replace(probe, display_id=token, session_id=None)
                     if token is not None
-                    else probe
+                    else _recover_lifecycle_identity_by_name(
+                        binary, probe, repository, set(before), work_deadline
+                    )
                 )
+                if candidate is None:
+                    acceptance["respawn"]["full_uuid"] = "probe_inconclusive"
+                    raise CharacterizationError(
+                        "tokenless respawn identity recovery failed"
+                    )
                 probe = candidate
+                assert probe.display_id is not None
+                cleanup_probes[probe.display_id] = probe
                 respawned = _reconcile_lifecycle_identity(
                     binary, candidate, repository, set(), work_deadline
                 )
@@ -2456,12 +2538,28 @@ def collect_unattended_lifecycle_characterization(
             archive_error = caught
         finally:
             if launched:
-                cleanup_confirmed = _lifecycle_cleanup(
-                    binary,
-                    probe,
-                    repository,
-                    min(deadline, time.monotonic() + LIFECYCLE_CLEANUP_SECONDS),
+                cleanup_deadline = min(
+                    deadline, time.monotonic() + LIFECYCLE_CLEANUP_SECONDS
                 )
+                cleanup_confirmed = _lifecycle_cleanup(
+                    binary, probe, repository, cleanup_deadline
+                )
+                for cleanup_probe in cleanup_probes.values():
+                    if cleanup_probe.display_id == probe.display_id:
+                        continue
+                    if _remaining(cleanup_deadline) <= 0:
+                        break
+                    assert cleanup_probe.display_id is not None
+                    _run_owned_lifecycle_command(
+                        binary,
+                        cleanup_probe,
+                        (str(binary), "stop", cleanup_probe.display_id),
+                        repository,
+                        min(
+                            LIFECYCLE_TIMEOUT_SECONDS,
+                            _remaining(cleanup_deadline),
+                        ),
+                    )
             daemon["after_final_stop"] = _daemon_snapshot(
                 binary, probe, repository, deadline
             )
