@@ -36,7 +36,9 @@ def test_unattended_observer_hook_characterization(tmp_path: Path) -> None:
 
     assert artifact.exists()
     assert result["context"] == "unattended_bg"
-    assert result["estimated_test_owned_session_count"] == 1
+    assert result["estimated_test_owned_session_count"] == len(
+        OBSERVER_EVENT_MATCHERS[2:]
+    )
     assert result["cleanup"]["confirmed"] is True
     assert result["fully_characterized"] is False
     assert [entry["event"] for entry in result["events"]] == list(

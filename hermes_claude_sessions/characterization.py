@@ -14,6 +14,7 @@ import json
 import os
 import re
 import selectors
+import shlex
 import signal
 import subprocess
 import sys
@@ -51,7 +52,9 @@ SAFE_COMMANDS: tuple[tuple[str, ...], ...] = (
     ("daemon", "status"),
     ("agents", "--json", "--all"),
 )
-EXACT_CLAUDE_BIN = "/Users/ryo/.local/bin/claude"
+EXPECTED_CLAUDE_BIN = Path.home() / ".local" / "bin" / "claude"
+# Compatibility name; its value is derived from HOME, never a committed username.
+EXACT_CLAUDE_BIN = str(EXPECTED_CLAUDE_BIN)
 OBSERVER_EVENT_MATCHERS = (
     "SessionStart",
     "SessionEnd",
@@ -61,6 +64,7 @@ OBSERVER_EVENT_MATCHERS = (
     "agent_completed",
 )
 OBSERVER_TIMEOUT_SECONDS = 10.0
+OBSERVER_OBSERVATION_SECONDS = 2.0
 OBSERVER_SUITE_TIMEOUT_SECONDS = 40.0
 OBSERVER_EVIDENCE_LIMIT = 16
 OBSERVER_INPUT_LIMIT = 32_768
@@ -96,9 +100,10 @@ def _require_acknowledged_binary(capability: object) -> Path:
 def _require_exact_observer_capability(capability: object) -> Path:
     """Narrow Task 0B to the explicitly approved executable, not any capability."""
     binary = _require_acknowledged_binary(capability)
-    if str(binary) != EXACT_CLAUDE_BIN:
+    if binary.resolve() != EXPECTED_CLAUDE_BIN.resolve():
         raise CharacterizationError(
-            f"CLAUDE_BIN must be exactly {EXACT_CLAUDE_BIN} for observer probing"
+            "CLAUDE_BIN must resolve exactly to ${HOME}/.local/bin/claude "
+            "for observer probing"
         )
     return binary
 
@@ -598,7 +603,7 @@ sys.exit(0)
 
 
 def _create_observer_plugin(plugin_directory: Path, evidence_directory: Path) -> None:
-    """Create a session-local observer-only plugin; never a production bundle."""
+    """Create a silent observer plugin, quoting every shell-interpreted path."""
     hooks_directory = plugin_directory / "hooks"
     hooks_directory.mkdir(parents=True)
     metadata_directory = plugin_directory / ".claude-plugin"
@@ -610,7 +615,8 @@ def _create_observer_plugin(plugin_directory: Path, evidence_directory: Path) ->
     observer.write_text(_observer_program(), encoding="utf-8")
     observer.chmod(0o700)
     command_prefix = (
-        f"CLAUDE_OBSERVER_EVIDENCE_DIR={evidence_directory} {sys.executable} {observer}"
+        f"CLAUDE_OBSERVER_EVIDENCE_DIR={shlex.quote(str(evidence_directory))} "
+        f"{shlex.quote(sys.executable)} {shlex.quote(str(observer))}"
     )
     hooks: dict[str, list[dict[str, Any]]] = {
         "SessionStart": [
@@ -638,48 +644,76 @@ def _create_observer_plugin(plugin_directory: Path, evidence_directory: Path) ->
     )
 
 
-def _create_probe_evidence_directory(root: Path) -> Path:
-    evidence = root / "evidence"
-    evidence.mkdir()
-    return evidence
+@dataclasses.dataclass(frozen=True)
+class _OwnedProbe:
+    display_name: str
+    matcher: str
+    session_id: str | None = None
+    display_id: str | None = None
 
 
 def _owned_session_id() -> str:
-    return f"observer-{uuid.uuid4()}"
+    """Mint a UUID namespace used only to make the probe name unique."""
+    return str(uuid.uuid4())
+
+
+def _mint_owned_probe(matcher: str) -> _OwnedProbe:
+    namespace = _owned_session_id()
+    return _OwnedProbe(f"observer-{matcher}-{namespace}", matcher)
+
+
+def _agent_identity(item: Mapping[str, Any]) -> str | None:
+    full = item.get("sessionId")
+    short = item.get("id")
+    return full if isinstance(full, str) else short if isinstance(short, str) else None
+
+
+def _owned_row(rows: object, owned: _OwnedProbe) -> Mapping[str, Any] | None:
+    if not isinstance(rows, list):
+        return None
+    for item in rows:
+        if not isinstance(item, Mapping):
+            continue
+        if owned.session_id is not None and item.get("sessionId") == owned.session_id:
+            return item
+        if owned.session_id is None and item.get("name") == owned.display_name:
+            return item
+    return None
+
+
+def _listing(
+    binary: Path, owned: _OwnedProbe, cwd: Path, timeout: float
+) -> CommandCapture:
+    return _run_owned_observer_command(
+        binary, owned, (str(binary), "agents", "--json", "--all"), cwd, timeout
+    )
 
 
 def _run_owned_observer_command(
-    binary: Path, argv: tuple[str, ...], cwd: Path
+    binary: Path, owned: _OwnedProbe, argv: tuple[str, ...], cwd: Path, timeout: float
 ) -> CommandCapture:
-    """Run only exact probe-owned argv shapes; this is intentionally private."""
+    """Execute only collector-minted ownership identities and exact private shapes."""
     if not argv or argv[0] != str(binary):
         raise CharacterizationError("observer command must use the validated binary")
     suffix = argv[1:]
     is_listing = suffix == ("agents", "--json", "--all")
-    is_stop = (
-        len(suffix) == 2 and suffix[0] == "stop" and suffix[1].startswith("observer-")
-    )
+    is_stop = owned.display_id is not None and suffix == ("stop", owned.display_id)
+    expected_mode = "manual"
     is_launch = (
-        len(suffix) == 11
-        and suffix[0] == "--bg"
-        and suffix[1] == "--session-id"
-        and suffix[2].startswith("observer-")
-        and suffix[3] == "--name"
-        and suffix[4].startswith("observer-")
-        and suffix[5:7] == ("--permission-mode", "default")
-        and suffix[7] == "--plugin-dir"
-        and suffix[9] == "-p"
-        and suffix[10] == "observer hook characterization"
+        len(suffix) == 8
+        and suffix[:3] == ("--bg", "--name", owned.display_name)
+        and suffix[3:5] == ("--permission-mode", expected_mode)
+        and suffix[5] == "--plugin-dir"
+        and suffix[7] == _probe_prompt(owned.matcher)
     )
     if not (is_listing or is_stop or is_launch):
         raise CharacterizationError("observer command shape is not probe-owned")
-    return _run_command(argv, timeout_seconds=OBSERVER_TIMEOUT_SECONDS, cwd=cwd)
+    return _run_command(argv, timeout_seconds=timeout, cwd=cwd)
 
 
-def _event_rows(evidence_directory: Path) -> list[dict[str, Any]]:
+def _read_evidence(evidence_directory: Path) -> set[str]:
     observed: set[str] = set()
-    evidence_files = sorted(evidence_directory.glob("*.json"))[:OBSERVER_EVIDENCE_LIMIT]
-    for path in evidence_files:
+    for path in sorted(evidence_directory.glob("*.json"))[:OBSERVER_EVIDENCE_LIMIT]:
         try:
             candidate = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -689,113 +723,359 @@ def _event_rows(evidence_directory: Path) -> list[dict[str, Any]]:
             and candidate.get("event") in OBSERVER_EVENT_MATCHERS
         ):
             observed.add(cast(str, candidate["event"]))
-    return [
-        {
-            "event": event,
-            "status": "observed" if event in observed else "probe_inconclusive",
-            "evidence": {
-                "metadata_records": len(evidence_files),
-                "raw_retained": False,
-            },
-        }
-        for event in OBSERVER_EVENT_MATCHERS
-    ]
+    return observed
+
+
+def _snapshot_agents(capture: CommandCapture) -> dict[str, str] | None:
+    if capture.returncode != 0 or capture.timed_out:
+        return None
+    try:
+        rows = json.loads(capture.stdout)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(rows, list):
+        return None
+    snapshot: dict[str, str] = {}
+    for item in rows:
+        if isinstance(item, Mapping):
+            identity = _agent_identity(item)
+            state = item.get("state")
+            if identity is not None and isinstance(state, str):
+                snapshot[identity] = state
+    return snapshot
+
+
+def _remaining(deadline: float) -> float:
+    return max(0.0, deadline - time.monotonic())
+
+
+def _observe_exact_owned(
+    binary: Path, owned: _OwnedProbe, cwd: Path, evidence: Path, deadline: float
+) -> tuple[bool, bool, set[str]]:
+    """Read-only poll before cleanup and return identity, completion, evidence."""
+    identity_seen = False
+    completed = False
+    observed: set[str] = set()
+    observation_deadline = min(
+        deadline, time.monotonic() + OBSERVER_OBSERVATION_SECONDS
+    )
+    while _remaining(observation_deadline) > 0:
+        capture = _listing(
+            binary,
+            owned,
+            cwd,
+            min(OBSERVER_TIMEOUT_SECONDS, _remaining(observation_deadline)),
+        )
+        if capture.returncode == 0 and not capture.timed_out:
+            try:
+                row = _owned_row(json.loads(capture.stdout), owned)
+            except json.JSONDecodeError:
+                row = None
+            if row is not None:
+                identity_seen = True
+                state = row.get("state")
+                completed = isinstance(state, str) and state in {
+                    "completed",
+                    "failed",
+                    "stopped",
+                }
+        observed |= _read_evidence(evidence)
+        time.sleep(min(0.2, _remaining(observation_deadline)))
+    return identity_seen, completed, observed
+
+
+def _discover_native_identity(
+    binary: Path,
+    owned: _OwnedProbe,
+    cwd: Path,
+    pre_existing: Mapping[str, str],
+    deadline: float,
+) -> _OwnedProbe | None:
+    """Bind a unique test-owned name to Claude's generated short/full identities."""
+    while _remaining(deadline) > 0:
+        capture = _listing(
+            binary, owned, cwd, min(OBSERVER_TIMEOUT_SECONDS, _remaining(deadline))
+        )
+        if capture.returncode == 0 and not capture.timed_out:
+            try:
+                rows = json.loads(capture.stdout)
+            except json.JSONDecodeError:
+                rows = None
+            row = _owned_row(rows, owned)
+            if row is not None:
+                full = row.get("sessionId")
+                short = row.get("id")
+                if (
+                    isinstance(full, str)
+                    and isinstance(short, str)
+                    and full not in pre_existing
+                    and full.startswith(f"{short}-")
+                ):
+                    return dataclasses.replace(owned, session_id=full, display_id=short)
+        time.sleep(min(0.2, _remaining(deadline)))
+    return None
+
+
+def _cleanup_owned(
+    binary: Path, owned: _OwnedProbe, cwd: Path, deadline: float
+) -> tuple[bool, CommandCapture | None, CommandCapture | None]:
+    """Stop only a read-back exact UUID and accept absence or terminal state."""
+    if _remaining(deadline) <= 0:
+        return False, None, None
+    stop = _run_owned_observer_command(
+        binary,
+        owned,
+        (str(binary), "stop", cast(str, owned.display_id)),
+        cwd,
+        min(OBSERVER_TIMEOUT_SECONDS, _remaining(deadline)),
+    )
+    latest: CommandCapture | None = None
+    while _remaining(deadline) > 0:
+        latest = _listing(
+            binary, owned, cwd, min(OBSERVER_TIMEOUT_SECONDS, _remaining(deadline))
+        )
+        if latest.returncode == 0 and not latest.timed_out:
+            try:
+                row = _owned_row(json.loads(latest.stdout), owned)
+            except json.JSONDecodeError:
+                row = None
+            if row is None or (
+                isinstance(row.get("state"), str)
+                and row["state"] in {"completed", "failed", "stopped"}
+            ):
+                return stop.returncode == 0 and not stop.timed_out, stop, latest
+        time.sleep(min(0.2, _remaining(deadline)))
+    return False, stop, latest
+
+
+def _probe_prompt(matcher: str) -> str:
+    prompts = {
+        "permission_prompt": (
+            "In this disposable repository, create only permission-probe.txt "
+            "containing probe. Request permission if needed, then stop."
+        ),
+        "idle_prompt": (
+            "Read only. Do not edit files. Wait for further input after stating "
+            "you need it."
+        ),
+        "agent_needs_input": (
+            "Read only. Ask one specific question needed before proceeding; "
+            "make no edits."
+        ),
+        "agent_completed": (
+            "Read only. Inspect the repository and respond with exactly one "
+            "sentence that the bounded probe is complete."
+        ),
+    }
+    return prompts[matcher]
+
+
+def _event_rows(per_case: Mapping[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    lifecycle = set().union(*(case["observed"] for case in per_case.values()))
+    rows: list[dict[str, Any]] = []
+    for event in OBSERVER_EVENT_MATCHERS:
+        case = per_case.get(event)
+        seen = event in (case["observed"] if case else lifecycle)
+        clean = bool(
+            case
+            and case["identity_seen"]
+            and case["completed"]
+            and case["cleanup_confirmed"]
+        )
+        metadata_records = (
+            int(case["metadata_records"])
+            if case
+            else sum(int(item["metadata_records"]) for item in per_case.values())
+        )
+        rows.append(
+            {
+                "event": event,
+                "status": "observed"
+                if seen
+                else "not_observed"
+                if clean
+                else "probe_inconclusive",
+                "evidence": {
+                    "metadata_records": metadata_records,
+                    "raw_retained": False,
+                    "unattended_context": "unattended_bg",
+                },
+            }
+        )
+    return rows
 
 
 def collect_unattended_observer_hook_characterization(
     capability: object, destination: Path
 ) -> dict[str, Any]:
-    """Probe one fresh exact-owned ``--bg`` session with narrow cleanup."""
+    """Bounded isolated matcher probes, with exact UUID read-back and cleanup."""
     binary = _require_exact_observer_capability(capability)
-    session_id = _owned_session_id()
-    cleanup_capture: CommandCapture | None = None
-    after_capture: CommandCapture | None = None
+    deadline = time.monotonic() + OBSERVER_SUITE_TIMEOUT_SECONDS
+    cases = OBSERVER_EVENT_MATCHERS[2:]
+    owned_cases = [(matcher, _mint_owned_probe(matcher)) for matcher in cases]
+    per_case: dict[str, dict[str, Any]] = {}
+    cleanup_failures: list[str] = []
     with tempfile.TemporaryDirectory(prefix="claude-observer-") as temporary_name:
         root = Path(temporary_name)
         repository = root / "repository"
         repository.mkdir()
         initialized = _run_command(
             ("git", "init", "--quiet"),
-            timeout_seconds=OBSERVER_TIMEOUT_SECONDS,
+            timeout_seconds=min(OBSERVER_TIMEOUT_SECONDS, _remaining(deadline)),
             cwd=repository,
         )
         if initialized.returncode != 0 or initialized.timed_out:
             raise CharacterizationError(
                 "failed to initialize fresh probe Git repository"
             )
-        evidence = _create_probe_evidence_directory(root)
-        plugin = root / "plugin"
-        _create_observer_plugin(plugin, evidence)
-        launch_argv = (
-            str(binary),
-            "--bg",
-            "--session-id",
-            session_id,
-            "--name",
-            session_id,
-            "--permission-mode",
-            "default",
-            "--plugin-dir",
-            str(plugin),
-            "-p",
-            "observer hook characterization",
+        before = _snapshot_agents(
+            _listing(
+                binary,
+                owned_cases[0][1],
+                repository,
+                min(OBSERVER_TIMEOUT_SECONDS, _remaining(deadline)),
+            )
         )
-        launch_capture = _run_owned_observer_command(binary, launch_argv, repository)
-        try:
-            cleanup_capture = _run_owned_observer_command(
-                binary, (str(binary), "stop", session_id), repository
+        if before is None:
+            raise CharacterizationError("could not capture pre-probe agents listing")
+        for matcher, owned in owned_cases:
+            if _remaining(deadline) <= 0:
+                break
+            case_root = root / matcher
+            evidence = case_root / "evidence"
+            evidence.mkdir(parents=True)
+            plugin = case_root / "plugin"
+            _create_observer_plugin(plugin, evidence)
+            mode = "manual"
+            launch = _run_owned_observer_command(
+                binary,
+                owned,
+                (
+                    str(binary),
+                    "--bg",
+                    "--name",
+                    owned.display_name,
+                    "--permission-mode",
+                    mode,
+                    "--plugin-dir",
+                    str(plugin),
+                    _probe_prompt(matcher),
+                ),
+                repository,
+                min(OBSERVER_TIMEOUT_SECONDS, _remaining(deadline)),
             )
-            after_capture = _run_owned_observer_command(
-                binary, (str(binary), "agents", "--json", "--all"), repository
+            discovered = _discover_native_identity(
+                binary, owned, repository, before, deadline
             )
-            try:
-                remaining = json.loads(after_capture.stdout)
-                cleanup_confirmed = (
-                    cleanup_capture.returncode == 0
-                    and not cleanup_capture.timed_out
-                    and isinstance(remaining, list)
-                    and all(
-                        item.get("id") != session_id
-                        for item in remaining
-                        if isinstance(item, Mapping)
-                    )
+            if discovered is not None:
+                owned = discovered
+            identity_seen, completed, observed = _observe_exact_owned(
+                binary, owned, repository, evidence, deadline
+            )
+            cleanup_confirmed = False
+            stop: CommandCapture | None = None
+            after: CommandCapture | None = None
+            if identity_seen:
+                cleanup_confirmed, stop, after = _cleanup_owned(
+                    binary, owned, repository, deadline
                 )
-            except json.JSONDecodeError:
+            else:
+                # A failed launch never authorizes stop; prove exact absence read-only.
+                after = _listing(
+                    binary,
+                    owned,
+                    repository,
+                    min(OBSERVER_TIMEOUT_SECONDS, _remaining(deadline)),
+                )
                 cleanup_confirmed = False
-        finally:
-            # No broad cleanup: the sole generated ID is the sole target.
-            pass
+                if after.returncode == 0 and not after.timed_out:
+                    try:
+                        cleanup_confirmed = (
+                            _owned_row(json.loads(after.stdout), owned) is None
+                        )
+                    except json.JSONDecodeError:
+                        cleanup_confirmed = False
+            observed |= _read_evidence(evidence)
+            if not cleanup_confirmed:
+                cleanup_failures.append(owned.session_id or owned.display_name)
+            per_case[matcher] = {
+                "owned": owned,
+                "launch": launch,
+                "identity_seen": identity_seen,
+                "completed": completed,
+                "observed": observed,
+                "metadata_records": len(list(evidence.glob("*.json"))),
+                "cleanup_confirmed": cleanup_confirmed,
+                "stop": stop,
+                "after": after,
+            }
+        events = _event_rows(per_case)
+        after_unrelated = _snapshot_agents(
+            _listing(
+                binary,
+                owned_cases[0][1],
+                repository,
+                min(OBSERVER_TIMEOUT_SECONDS, _remaining(deadline)),
+            )
+        )
+        unrelated_untouched = (
+            after_unrelated is not None
+            and {
+                identity: state
+                for identity, state in after_unrelated.items()
+                if identity in before
+            }
+            == before
+        )
         result: dict[str, Any] = {
-            "schema_version": 1,
+            "schema_version": 2,
             "context": "unattended_bg",
             "fully_characterized": False,
             "manual_gates_deferred": ["permission", "lifecycle", "worktree"],
-            "estimated_test_owned_session_count": 1,
-            "actual_test_owned_session_count": int(
-                launch_capture.returncode == 0
-                and not launch_capture.timed_out
-                and launch_capture.error is None
+            "estimated_test_owned_session_count": len(cases),
+            "actual_test_owned_session_count": sum(
+                int(case["identity_seen"]) for case in per_case.values()
             ),
-            "events": _event_rows(evidence),
+            "events": events,
+            "probes": [
+                {
+                    "matcher": matcher,
+                    "owned_session_id": case["owned"].session_id,
+                    "owned_display_id": case["owned"].display_id,
+                    "display_name": case["owned"].display_name,
+                    "identity_seen": case["identity_seen"],
+                    "completed": case["completed"],
+                    "cleanup_confirmed": case["cleanup_confirmed"],
+                    "launch_returncode": case["launch"].returncode,
+                    "launch_timed_out": case["launch"].timed_out,
+                    "launch_error": case["launch"].error,
+                    "launch_stderr": case["launch"].stderr,
+                    "metadata_records": case["metadata_records"],
+                }
+                for matcher, case in per_case.items()
+            ],
             "cleanup": {
-                "owned_session_id": session_id,
-                "confirmed": cleanup_confirmed,
-                "stop_returncode": cleanup_capture.returncode
-                if cleanup_capture
-                else None,
-                "post_cleanup_listing_returncode": after_capture.returncode
-                if after_capture
-                else None,
+                "confirmed": not cleanup_failures,
+                "failed_owned_session_ids": cleanup_failures,
             },
-            "launch": {
-                "returncode": launch_capture.returncode,
-                "timed_out": launch_capture.timed_out,
-                "error": launch_capture.error,
+            "suite_deadline_seconds": OBSERVER_SUITE_TIMEOUT_SECONDS,
+            "unrelated_agents": {
+                "pre_existing_count": len(before),
+                "unchanged": unrelated_untouched,
             },
         }
         atomic_write_contract(destination, result)
-        if not cleanup_confirmed:
+        if result["actual_test_owned_session_count"] != len(cases):
             raise CharacterizationError(
-                f"cleanup could not be confirmed for exact owned session {session_id}"
+                "one or more exact owned observer sessions failed identity read-back"
+            )
+        if cleanup_failures:
+            raise CharacterizationError(
+                "cleanup could not be confirmed for exact owned session "
+                + ", ".join(cleanup_failures)
+            )
+        if not unrelated_untouched:
+            raise CharacterizationError(
+                "pre-existing unrelated agent states changed during probe"
             )
         return sanitize_contract(result)

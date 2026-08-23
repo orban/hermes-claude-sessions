@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from pathlib import Path
 
 import pytest
@@ -24,7 +25,10 @@ from hermes_claude_sessions.characterization import (
     CharacterizationError,
     CommandCapture,
     _create_observer_plugin,
+    _mint_owned_probe,
+    _owned_session_id,
     _run_command,
+    _run_owned_observer_command,
     atomic_write_contract,
     collect_live_contract,
     collect_unattended_observer_hook_characterization,
@@ -549,27 +553,46 @@ def test_observer_plugin_is_non_deciding_and_observer_never_emits_output(
     assert unavailable_run.stderr == ""
 
 
-def test_unattended_probe_uses_only_generated_owned_session_and_sanitizes_artifact(
+def test_unattended_probe_isolates_exact_uuid_cases_and_waits_before_stop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     artifact = tmp_path / "unattended-hooks.json"
     calls: list[tuple[str, ...]] = []
-    evidence = tmp_path / "fake-evidence"
-    evidence.mkdir()
-    (evidence / "SessionStart.json").write_text('{"event":"SessionStart"}')
+    active: dict[str, str] = {}
 
     def fake_capability(capability: object) -> Path:
         assert capability is marker
         return Path(EXACT_CLAUDE_BIN)
 
     def fake_owned_run(
-        binary: Path, argv: tuple[str, ...], cwd: Path
+        binary: Path,
+        owned: object,
+        argv: tuple[str, ...],
+        cwd: Path,
+        timeout: float,
     ) -> CommandCapture:
         assert binary == Path(EXACT_CLAUDE_BIN)
         assert cwd.name == "repository"
+        assert timeout >= 0
         calls.append(argv)
+        if argv[1] == "--bg":
+            name = argv[3]
+            session_id = f"{uuid.uuid4()}"
+            active[session_id] = f"completed:{name}"
+        elif argv[1] == "stop":
+            session_id = next(key for key in active if key.startswith(f"{argv[2]}-"))
+            active.pop(session_id)
         if argv[1:3] == ("agents", "--json"):
-            return CommandCapture(argv, 0, "[]", "", False, None)
+            rows = [
+                {
+                    "id": session_id[:8],
+                    "sessionId": session_id,
+                    "name": state.split(":", 1)[1],
+                    "state": state.split(":", 1)[0],
+                }
+                for session_id, state in active.items()
+            ]
+            return CommandCapture(argv, 0, json.dumps(rows), "", False, None)
         return CommandCapture(argv, 0, "", "", False, None)
 
     marker = object()
@@ -581,35 +604,105 @@ def test_unattended_probe_uses_only_generated_owned_session_and_sanitizes_artifa
         "hermes_claude_sessions.characterization._run_owned_observer_command",
         fake_owned_run,
     )
-    monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._create_probe_evidence_directory",
-        lambda _: evidence,
-    )
 
     result = collect_unattended_observer_hook_characterization(marker, artifact)
 
-    assert artifact.exists()
-    assert result["context"] == "unattended_bg"
-    assert result["fully_characterized"] is False
-    assert result["estimated_test_owned_session_count"] == 1
-    assert result["actual_test_owned_session_count"] == 1
+    launches = [argv for argv in calls if argv[1] == "--bg"]
+    stops = [argv for argv in calls if argv[1] == "stop"]
+    assert len(launches) == len(OBSERVER_EVENT_MATCHERS[2:])
+    assert len(stops) == len(launches)
+    assert result["estimated_test_owned_session_count"] == len(launches)
+    assert result["actual_test_owned_session_count"] == len(launches)
     assert result["cleanup"]["confirmed"] is True
-    assert any("--bg" in argv for argv in calls)
-    stop = next(argv for argv in calls if argv[1] == "stop")
-    assert stop[2].startswith("observer-")
-    assert all(
-        entry["status"] in {"observed", "not_observed", "probe_inconclusive"}
-        for entry in result["events"]
+    assert {probe["matcher"] for probe in result["probes"]} == set(
+        OBSERVER_EVENT_MATCHERS[2:]
     )
-    assert (
-        next(entry for entry in result["events"] if entry["event"] == "SessionStart")[
-            "status"
-        ]
-        == "observed"
-    )
+    for launch, stop in zip(launches, stops, strict=True):
+        launch_index = next(i for i, call in enumerate(calls) if call is launch)
+        stop_index = next(i for i, call in enumerate(calls) if call is stop)
+        assert launch[3].startswith("observer-")
+        assert len(stop[2]) == 8
+        assert "-p" not in launch
+        assert launch_index < stop_index
+        assert any(
+            call[1:3] == ("agents", "--json") and launch_index < index < stop_index
+            for index, call in enumerate(calls)
+        )
     written = artifact.read_text()
     assert str(tmp_path) not in written
     assert 'fully_characterized": true' not in written
+
+
+def test_owned_session_identity_is_a_uuid_separate_from_display_name() -> None:
+    session_id = _owned_session_id()
+    assert str(uuid.UUID(session_id)) == session_id
+    assert not session_id.startswith("observer-")
+
+
+def test_probe_fails_without_identity_readback_and_never_guesses_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[str, ...]] = []
+
+    def fake_run(
+        binary: Path,
+        owned: object,
+        argv: tuple[str, ...],
+        cwd: Path,
+        timeout: float,
+    ) -> CommandCapture:
+        calls.append(argv)
+        if argv[1:3] == ("agents", "--json"):
+            return CommandCapture(argv, 0, "[]", "", False, None)
+        return CommandCapture(argv, 0, "", "", False, None)
+
+    monkeypatch.setattr(
+        "hermes_claude_sessions.characterization._require_exact_observer_capability",
+        lambda _: Path(EXACT_CLAUDE_BIN),
+    )
+    monkeypatch.setattr(
+        "hermes_claude_sessions.characterization._run_owned_observer_command",
+        fake_run,
+    )
+    monkeypatch.setattr(
+        "hermes_claude_sessions.characterization.OBSERVER_SUITE_TIMEOUT_SECONDS",
+        0.05,
+    )
+    started = time.monotonic()
+    with pytest.raises(CharacterizationError, match="failed identity read-back"):
+        collect_unattended_observer_hook_characterization(
+            object(), tmp_path / "out.json"
+        )
+    assert time.monotonic() - started < 1
+    assert not [argv for argv in calls if argv[1] == "stop"]
+
+
+def test_observer_plugin_quotes_paths_with_shell_metacharacters(tmp_path: Path) -> None:
+    plugin = tmp_path / "plugin with spaces;$(nope)"
+    evidence = tmp_path / "evidence with spaces;$(nope)"
+    _create_observer_plugin(plugin, evidence)
+    command = json.loads((plugin / "hooks" / "hooks.json").read_text())["hooks"][
+        "SessionStart"
+    ][0]["hooks"][0]["command"]
+    completed = subprocess.run(
+        command, shell=True, input="{}", capture_output=True, text=True
+    )
+    assert completed.returncode == 0
+    assert completed.stdout == ""
+    assert completed.stderr == ""
+    assert list(evidence.glob("*.json"))
+
+
+def test_owned_runner_rejects_arbitrary_observer_prefix_stop(tmp_path: Path) -> None:
+    owned = _mint_owned_probe("idle_prompt")
+    with pytest.raises(CharacterizationError, match="probe-owned"):
+        _run_owned_observer_command(
+            Path(EXACT_CLAUDE_BIN),
+            owned,
+            (EXACT_CLAUDE_BIN, "stop", "observer-not-owned"),
+            tmp_path,
+            1,
+        )
 
 
 def test_unattended_fixture_is_schema_only_not_synthetic_live_evidence() -> None:
