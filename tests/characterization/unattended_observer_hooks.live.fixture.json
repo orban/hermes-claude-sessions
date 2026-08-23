@@ -62,7 +62,7 @@
       "status": "probe_inconclusive"
     }
   ],
-  "fingerprint": "4e84220284d50a76b52220256fca5ce6742d5c60657a234221fe3d2447082bdc",
+  "fingerprint": "7aaf1d77e3982a124258ce0f5d1fe0c7135f09ec02d33f518acc96f421f3226e",
   "fully_characterized": false,
   "manual_gates_deferred": [
     "permission",
@@ -80,10 +80,9 @@
       "launch_stderr_bytes": 31,
       "launch_stderr_present": true,
       "launch_timed_out": false,
+      "launch_token_reconciled": true,
       "matcher": "permission_prompt",
-      "metadata_records": 2,
-      "owned_display_id": "f0d013ef",
-      "owned_session_id": "<NAMESPACE>"
+      "metadata_records": 2
     },
     {
       "cleanup_confirmed": true,
@@ -95,10 +94,9 @@
       "launch_stderr_bytes": 0,
       "launch_stderr_present": false,
       "launch_timed_out": false,
+      "launch_token_reconciled": true,
       "matcher": "idle_prompt",
-      "metadata_records": 2,
-      "owned_display_id": "804cb794",
-      "owned_session_id": "<NAMESPACE>"
+      "metadata_records": 2
     },
     {
       "cleanup_confirmed": true,
@@ -110,10 +108,9 @@
       "launch_stderr_bytes": 0,
       "launch_stderr_present": false,
       "launch_timed_out": false,
+      "launch_token_reconciled": true,
       "matcher": "agent_needs_input",
-      "metadata_records": 2,
-      "owned_display_id": "541f6a04",
-      "owned_session_id": "<NAMESPACE>"
+      "metadata_records": 2
     },
     {
       "cleanup_confirmed": true,
@@ -125,10 +122,9 @@
       "launch_stderr_bytes": 0,
       "launch_stderr_present": false,
       "launch_timed_out": false,
+      "launch_token_reconciled": true,
       "matcher": "agent_completed",
-      "metadata_records": 2,
-      "owned_display_id": "29a564e4",
-      "owned_session_id": "<NAMESPACE>"
+      "metadata_records": 2
     }
   ],
   "schema_version": 2,

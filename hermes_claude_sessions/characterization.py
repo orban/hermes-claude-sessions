@@ -1124,9 +1124,11 @@ def collect_unattended_observer_hook_characterization(
             "probes": [
                 {
                     "matcher": matcher,
-                    "owned_session_id": case["owned"].session_id,
-                    "owned_display_id": case["owned"].display_id,
                     "display_name": case["owned"].display_name,
+                    "launch_token_reconciled": (
+                        case["owned"].display_id is not None
+                        and case["owned"].session_id is not None
+                    ),
                     "identity_seen": case["identity_seen"],
                     "completed": case["completed"],
                     "cleanup_confirmed": case["cleanup_confirmed"],

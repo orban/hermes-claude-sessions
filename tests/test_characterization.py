@@ -631,6 +631,9 @@ def test_unattended_probe_isolates_exact_uuid_cases_and_waits_before_stop(
     assert {probe["matcher"] for probe in result["probes"]} == set(
         OBSERVER_EVENT_MATCHERS[2:]
     )
+    assert all("owned_display_id" not in probe for probe in result["probes"])
+    assert all("owned_session_id" not in probe for probe in result["probes"])
+    assert all(probe["launch_token_reconciled"] is True for probe in result["probes"])
     for launch, stop in zip(launches, stops, strict=True):
         launch_index = next(i for i, call in enumerate(calls) if call is launch)
         stop_index = next(i for i, call in enumerate(calls) if call is stop)
@@ -1103,6 +1106,9 @@ def test_live_fixture_contains_no_raw_launch_output() -> None:
     }
     assert all("launch_stderr" not in probe for probe in payload["probes"])
     assert all("launch_stdout" not in probe for probe in payload["probes"])
+    assert all("owned_display_id" not in probe for probe in payload["probes"])
+    assert all("owned_session_id" not in probe for probe in payload["probes"])
+    assert all(probe["launch_token_reconciled"] is True for probe in payload["probes"])
 
 
 def test_unattended_fixture_is_schema_only_not_synthetic_live_evidence() -> None:
