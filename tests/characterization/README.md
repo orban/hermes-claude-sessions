@@ -40,5 +40,33 @@ absence or a terminal stopped state; a verification failure raises with the exac
 owned ID and never broadens cleanup. It also compares pre-existing unrelated
 session identities/states before and after. The committed
 `unattended_observer_hooks.fixture.json` is schema-only, sanitized, and is not
-live evidence. Permission, lifecycle/worktree, state-normalization, and runtime
-integration characterization remain deferred.
+live evidence. Permission, lifecycle/state-normalization, and runtime integration characterization
+remain deferred.
+
+## Disposable worktree/edit probe (Task 0C-A)
+
+`test_worktree_edit_live.py` is separately opt-in with the same two cost
+acknowledgements and accepts only `CLAUDE_BIN=${HOME}/.local/bin/claude` after
+exact resolution. It creates one fresh temporary Git repository, locally
+configures only that repository, commits a test-owned `seed.txt`, snapshots
+native agents and `git worktree list --porcelain`, and launches exactly one
+UUID-namespaced `--bg` session in `acceptEdits` mode. The prompt authorizes
+only one deterministic append to `seed.txt`; it asks for no other action.
+
+The session-local `--plugin-dir` contains only the existing silent metadata
+observer. It stores bounded event type, byte count, and `cwd` only; no raw
+payload, network operation, decision hook, `WorktreeCreate`, or
+`WorktreeRemove` is registered. The probe records whether hook cwd agrees with
+the Git-discovered effective worktree, but treats absent hook evidence as
+inconclusive rather than guessing.
+
+After a successful launch, the exact short launch token must reconcile with one
+name-matching canonical UUID absent from the pre-launch native snapshot. Every
+accepted launch enters `finally`: it runs only `claude stop <exact-token>`, then
+requires absence or an exact terminal row. Ambiguous identities, duplicate rows,
+missing tokens, or failed cleanup fail loudly; no worktree is removed. Before
+temporary teardown, the probe atomically persists only a bounded sanitized diff
+and metadata, then compares all pre-existing native identity/state rows. It
+reports characteristics such as isolation, edit location, primary-checkout
+integrity, and post-stop artifact preservation without claiming full
+characterization.
