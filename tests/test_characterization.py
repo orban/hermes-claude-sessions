@@ -26,6 +26,7 @@ from hermes_claude_sessions.characterization import (
     CommandCapture,
     _create_observer_plugin,
     _mint_owned_probe,
+    _owned_rows,
     _owned_session_id,
     _run_command,
     _run_owned_observer_command,
@@ -604,6 +605,10 @@ def test_unattended_probe_isolates_exact_uuid_cases_and_waits_before_stop(
         "hermes_claude_sessions.characterization._run_owned_observer_command",
         fake_owned_run,
     )
+    monkeypatch.setattr(
+        "hermes_claude_sessions.characterization._observe_exact_owned",
+        lambda binary, owned, cwd, evidence, deadline: (False, False, set()),
+    )
 
     result = collect_unattended_observer_hook_characterization(marker, artifact)
 
@@ -703,6 +708,35 @@ def test_owned_runner_rejects_arbitrary_observer_prefix_stop(tmp_path: Path) -> 
             tmp_path,
             1,
         )
+
+
+def test_duplicate_owned_name_is_ambiguous() -> None:
+    owned = _mint_owned_probe("idle_prompt")
+    rows = [
+        {"id": "11111111", "sessionId": str(uuid.uuid4()), "name": owned.display_name},
+        {"id": "22222222", "sessionId": str(uuid.uuid4()), "name": owned.display_name},
+    ]
+    assert len(_owned_rows(rows, owned)) == 2
+
+
+def test_live_fixture_contains_no_raw_launch_output() -> None:
+    fixture = (
+        Path(__file__).parent
+        / "characterization"
+        / "unattended_observer_hooks.live.fixture.json"
+    )
+    payload = json.loads(fixture.read_text())
+    assert payload["actual_test_owned_session_count"] == 4
+    assert payload["cleanup"]["confirmed"] is True
+    assert payload["unrelated_agents"]["unchanged"] is True
+    statuses = {entry["event"]: entry["status"] for entry in payload["events"]}
+    assert statuses["SessionStart"] == "observed"
+    assert statuses["SessionEnd"] == "observed"
+    assert {statuses[event] for event in OBSERVER_EVENT_MATCHERS[2:]} == {
+        "probe_inconclusive"
+    }
+    assert all("launch_stderr" not in probe for probe in payload["probes"])
+    assert all("launch_stdout" not in probe for probe in payload["probes"])
 
 
 def test_unattended_fixture_is_schema_only_not_synthetic_live_evidence() -> None:

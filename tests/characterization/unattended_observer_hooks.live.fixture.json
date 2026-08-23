@@ -1,5 +1,5 @@
 {
-  "actual_test_owned_session_count": 0,
+  "actual_test_owned_session_count": 4,
   "cleanup": {
     "confirmed": true,
     "failed_owned_session_ids": []
@@ -10,25 +10,25 @@
     {
       "event": "SessionStart",
       "evidence": {
-        "metadata_records": 0,
+        "metadata_records": 8,
         "raw_retained": false,
         "unattended_context": "unattended_bg"
       },
-      "status": "probe_inconclusive"
+      "status": "observed"
     },
     {
       "event": "SessionEnd",
       "evidence": {
-        "metadata_records": 0,
+        "metadata_records": 8,
         "raw_retained": false,
         "unattended_context": "unattended_bg"
       },
-      "status": "probe_inconclusive"
+      "status": "observed"
     },
     {
       "event": "permission_prompt",
       "evidence": {
-        "metadata_records": 0,
+        "metadata_records": 2,
         "raw_retained": false,
         "unattended_context": "unattended_bg"
       },
@@ -37,7 +37,7 @@
     {
       "event": "idle_prompt",
       "evidence": {
-        "metadata_records": 0,
+        "metadata_records": 2,
         "raw_retained": false,
         "unattended_context": "unattended_bg"
       },
@@ -46,7 +46,7 @@
     {
       "event": "agent_needs_input",
       "evidence": {
-        "metadata_records": 0,
+        "metadata_records": 2,
         "raw_retained": false,
         "unattended_context": "unattended_bg"
       },
@@ -55,14 +55,14 @@
     {
       "event": "agent_completed",
       "evidence": {
-        "metadata_records": 0,
+        "metadata_records": 2,
         "raw_retained": false,
         "unattended_context": "unattended_bg"
       },
       "status": "probe_inconclusive"
     }
   ],
-  "fingerprint": "f3619fdfcabcb8b1c3e6097b723210d5c243128fe6b975e7e911152b307927b1",
+  "fingerprint": "4e84220284d50a76b52220256fca5ce6742d5c60657a234221fe3d2447082bdc",
   "fully_characterized": false,
   "manual_gates_deferred": [
     "permission",
@@ -73,48 +73,68 @@
     {
       "cleanup_confirmed": true,
       "completed": false,
-      "display_name": "observer-permission_prompt-7e68598a",
-      "identity_seen": false,
-      "launch_returncode": 1,
+      "display_name": "observer-permission_prompt-<NAMESPACE>",
+      "identity_seen": true,
+      "launch_error": null,
+      "launch_returncode": 0,
+      "launch_stderr_bytes": 31,
+      "launch_stderr_present": true,
+      "launch_timed_out": false,
       "matcher": "permission_prompt",
-      "metadata_records": 0,
+      "metadata_records": 2,
+      "owned_display_id": "f0d013ef",
       "owned_session_id": "<NAMESPACE>"
     },
     {
       "cleanup_confirmed": true,
       "completed": false,
-      "display_name": "observer-idle_prompt-01d63af0",
-      "identity_seen": false,
-      "launch_returncode": 1,
+      "display_name": "observer-idle_prompt-<NAMESPACE>",
+      "identity_seen": true,
+      "launch_error": null,
+      "launch_returncode": 0,
+      "launch_stderr_bytes": 0,
+      "launch_stderr_present": false,
+      "launch_timed_out": false,
       "matcher": "idle_prompt",
-      "metadata_records": 0,
+      "metadata_records": 2,
+      "owned_display_id": "804cb794",
       "owned_session_id": "<NAMESPACE>"
     },
     {
       "cleanup_confirmed": true,
       "completed": false,
-      "display_name": "observer-agent_needs_input-1faba6de",
-      "identity_seen": false,
-      "launch_returncode": 1,
+      "display_name": "observer-agent_needs_input-<NAMESPACE>",
+      "identity_seen": true,
+      "launch_error": null,
+      "launch_returncode": 0,
+      "launch_stderr_bytes": 0,
+      "launch_stderr_present": false,
+      "launch_timed_out": false,
       "matcher": "agent_needs_input",
-      "metadata_records": 0,
+      "metadata_records": 2,
+      "owned_display_id": "541f6a04",
       "owned_session_id": "<NAMESPACE>"
     },
     {
       "cleanup_confirmed": true,
       "completed": false,
-      "display_name": "observer-agent_completed-8fbb3efe",
-      "identity_seen": false,
-      "launch_returncode": 1,
+      "display_name": "observer-agent_completed-<NAMESPACE>",
+      "identity_seen": true,
+      "launch_error": null,
+      "launch_returncode": 0,
+      "launch_stderr_bytes": 0,
+      "launch_stderr_present": false,
+      "launch_timed_out": false,
       "matcher": "agent_completed",
-      "metadata_records": 0,
+      "metadata_records": 2,
+      "owned_display_id": "29a564e4",
       "owned_session_id": "<NAMESPACE>"
     }
   ],
   "schema_version": 2,
   "suite_deadline_seconds": 40.0,
   "unrelated_agents": {
-    "pre_existing_count": 3,
+    "pre_existing_count": 23,
     "unchanged": true
   }
 }

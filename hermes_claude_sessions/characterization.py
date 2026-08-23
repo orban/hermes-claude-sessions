@@ -66,6 +66,7 @@ OBSERVER_EVENT_MATCHERS = (
 OBSERVER_TIMEOUT_SECONDS = 10.0
 OBSERVER_OBSERVATION_SECONDS = 2.0
 OBSERVER_SUITE_TIMEOUT_SECONDS = 40.0
+OBSERVER_CLEANUP_SECONDS = 3.0
 OBSERVER_EVIDENCE_LIMIT = 16
 OBSERVER_INPUT_LIMIT = 32_768
 
@@ -668,17 +669,23 @@ def _agent_identity(item: Mapping[str, Any]) -> str | None:
     return full if isinstance(full, str) else short if isinstance(short, str) else None
 
 
-def _owned_row(rows: object, owned: _OwnedProbe) -> Mapping[str, Any] | None:
+def _owned_rows(rows: object, owned: _OwnedProbe) -> list[Mapping[str, Any]]:
     if not isinstance(rows, list):
-        return None
+        return []
+    matches: list[Mapping[str, Any]] = []
     for item in rows:
         if not isinstance(item, Mapping):
             continue
         if owned.session_id is not None and item.get("sessionId") == owned.session_id:
-            return item
+            matches.append(item)
         if owned.session_id is None and item.get("name") == owned.display_name:
-            return item
-    return None
+            matches.append(item)
+    return matches
+
+
+def _owned_row(rows: object, owned: _OwnedProbe) -> Mapping[str, Any] | None:
+    matches = _owned_rows(rows, owned)
+    return matches[0] if len(matches) == 1 else None
 
 
 def _listing(
@@ -801,8 +808,14 @@ def _discover_native_identity(
                 rows = json.loads(capture.stdout)
             except json.JSONDecodeError:
                 rows = None
-            row = _owned_row(rows, owned)
-            if row is not None:
+            matches = _owned_rows(rows, owned)
+            if len(matches) > 1:
+                raise CharacterizationError(
+                    "ambiguous native identity for exact owned name "
+                    f"{owned.display_name}"
+                )
+            if matches:
+                row = matches[0]
                 full = row.get("sessionId")
                 short = row.get("id")
                 if (
@@ -938,8 +951,12 @@ def collect_unattended_observer_hook_characterization(
         )
         if before is None:
             raise CharacterizationError("could not capture pre-probe agents listing")
-        for matcher, owned in owned_cases:
+        for case_index, (matcher, owned) in enumerate(owned_cases):
             if _remaining(deadline) <= 0:
+                break
+            remaining_cases = len(owned_cases) - case_index
+            work_deadline = deadline - (remaining_cases * OBSERVER_CLEANUP_SECONDS)
+            if _remaining(work_deadline) <= 0:
                 break
             case_root = root / matcher
             evidence = case_root / "evidence"
@@ -962,22 +979,26 @@ def collect_unattended_observer_hook_characterization(
                     _probe_prompt(matcher),
                 ),
                 repository,
-                min(OBSERVER_TIMEOUT_SECONDS, _remaining(deadline)),
+                min(OBSERVER_TIMEOUT_SECONDS, _remaining(work_deadline)),
             )
             discovered = _discover_native_identity(
-                binary, owned, repository, before, deadline
+                binary, owned, repository, before, work_deadline
             )
             if discovered is not None:
                 owned = discovered
-            identity_seen, completed, observed = _observe_exact_owned(
-                binary, owned, repository, evidence, deadline
+            observed_identity_seen, completed, observed = _observe_exact_owned(
+                binary, owned, repository, evidence, work_deadline
             )
+            identity_seen = discovered is not None or observed_identity_seen
             cleanup_confirmed = False
             stop: CommandCapture | None = None
             after: CommandCapture | None = None
-            if identity_seen:
+            if owned.session_id is not None and owned.display_id is not None:
+                cleanup_deadline = min(
+                    deadline, time.monotonic() + OBSERVER_CLEANUP_SECONDS
+                )
                 cleanup_confirmed, stop, after = _cleanup_owned(
-                    binary, owned, repository, deadline
+                    binary, owned, repository, cleanup_deadline
                 )
             else:
                 # A failed launch never authorizes stop; prove exact absence read-only.
@@ -1049,7 +1070,8 @@ def collect_unattended_observer_hook_characterization(
                     "launch_returncode": case["launch"].returncode,
                     "launch_timed_out": case["launch"].timed_out,
                     "launch_error": case["launch"].error,
-                    "launch_stderr": case["launch"].stderr,
+                    "launch_stderr_present": bool(case["launch"].stderr),
+                    "launch_stderr_bytes": len(case["launch"].stderr.encode("utf-8")),
                     "metadata_records": case["metadata_records"],
                 }
                 for matcher, case in per_case.items()
