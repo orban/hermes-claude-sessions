@@ -18,6 +18,7 @@ from hermes_claude_sessions.characterization import (
     _lifecycle_launch_argv,
     _lifecycle_roster_snapshot,
     _LifecycleProbe,
+    _recover_lifecycle_identity_by_name,
     _run_owned_lifecycle_command,
     collect_unattended_lifecycle_characterization,
     contract_fingerprint,
@@ -124,6 +125,36 @@ def test_lifecycle_roster_snapshot_rejects_malformed_json_structures(
         )
         == "ambiguous"
     )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    ["null", "{}", '"text"', '[{"name":"lifecycle-test"}, 1]', "["],
+)
+def test_tokenless_recovery_rejects_malformed_roster_structures(
+    payload: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    probe = _LifecycleProbe("lifecycle-test", "deadbeef")
+    monkeypatch.setattr(
+        "hermes_claude_sessions.characterization._lifecycle_listing",
+        lambda *args: CommandCapture(
+            (EXACT_CLAUDE_BIN, "agents", "--json", "--all"),
+            0,
+            payload,
+            "",
+            False,
+            None,
+        ),
+    )
+
+    with pytest.raises(CharacterizationError, match="malformed lifecycle roster"):
+        _recover_lifecycle_identity_by_name(
+            Path(EXACT_CLAUDE_BIN),
+            probe,
+            tmp_path,
+            set(),
+            time.monotonic() + 0.1,
+        )
 
 
 def test_lifecycle_probe_reconciles_exact_identity_exercises_identifiers_and_cleans(

@@ -2132,42 +2132,39 @@ def _recover_lifecycle_identity_by_name(
         if capture.returncode == 0 and not capture.timed_out and not capture.error:
             try:
                 payload = json.loads(capture.stdout)
-            except json.JSONDecodeError:
-                payload = None
-            if isinstance(payload, list) and all(
+            except json.JSONDecodeError as error:
+                raise CharacterizationError(
+                    "malformed lifecycle roster after tokenless respawn"
+                ) from error
+            if not isinstance(payload, list) or not all(
                 isinstance(row, Mapping) for row in payload
             ):
-                matches = [
-                    row for row in payload if row.get("name") == probe.display_name
-                ]
-                if len(matches) > 1:
-                    raise CharacterizationError(
-                        "ambiguous lifecycle identity after tokenless respawn"
-                    )
-                if len(matches) == 1:
-                    full, short = matches[0].get("sessionId"), matches[0].get("id")
-                    try:
-                        canonical = (
-                            isinstance(full, str) and str(uuid.UUID(full)) == full
-                        )
-                    except ValueError:
-                        canonical = False
-                    if not (
-                        canonical
-                        and isinstance(full, str)
-                        and isinstance(short, str)
-                        and re.fullmatch(r"[0-9a-f]{8}", short)
-                        and full[:8] == short
-                        and full not in excluded
-                    ):
-                        raise CharacterizationError(
-                            "malformed lifecycle identity after tokenless respawn"
-                        )
-                    return dataclasses.replace(probe, display_id=short, session_id=full)
-            elif payload is not None:
                 raise CharacterizationError(
                     "malformed lifecycle roster after tokenless respawn"
                 )
+            matches = [row for row in payload if row.get("name") == probe.display_name]
+            if len(matches) > 1:
+                raise CharacterizationError(
+                    "ambiguous lifecycle identity after tokenless respawn"
+                )
+            if len(matches) == 1:
+                full, short = matches[0].get("sessionId"), matches[0].get("id")
+                try:
+                    canonical = isinstance(full, str) and str(uuid.UUID(full)) == full
+                except ValueError:
+                    canonical = False
+                if not (
+                    canonical
+                    and isinstance(full, str)
+                    and isinstance(short, str)
+                    and re.fullmatch(r"[0-9a-f]{8}", short)
+                    and full[:8] == short
+                    and full not in excluded
+                ):
+                    raise CharacterizationError(
+                        "malformed lifecycle identity after tokenless respawn"
+                    )
+                return dataclasses.replace(probe, display_id=short, session_id=full)
         time.sleep(min(LIFECYCLE_POLL_SECONDS, _remaining(deadline)))
     return None
 
