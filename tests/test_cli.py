@@ -82,7 +82,7 @@ def test_handler_uses_native_inherited_terminal_argv(
     assert calls == [
         {
             "args": (expected_argv,),
-            "kwargs": {"text": True, "shell": False, "check": False},
+            "kwargs": {"shell": False, "check": False},
         }
     ]
 

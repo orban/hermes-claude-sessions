@@ -32,7 +32,7 @@ def handle_cli(args: argparse.Namespace) -> int:
     if args.claude_command == "attach":
         argv.append(args.identifier)
     try:
-        return subprocess.run(argv, text=True, shell=False, check=False).returncode
+        return subprocess.run(argv, shell=False, check=False).returncode
     except OSError:
         print(
             "Claude CLI could not be started; check CLAUDE_BIN or the claude "
