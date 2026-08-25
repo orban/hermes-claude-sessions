@@ -9,12 +9,18 @@ import sys
 from .tools import resolve_claude_bin
 
 
+def _attach_identifier(value: str) -> str:
+    if value.startswith("-"):
+        raise argparse.ArgumentTypeError("attach identifier must not start with '-'")
+    return value
+
+
 def setup_argparse(parser: argparse.ArgumentParser) -> None:
     """Build the ``hermes claude`` command tree."""
     commands = parser.add_subparsers(dest="claude_command", required=True)
     commands.add_parser("agents", help="Open the native Claude Agent View")
     attach = commands.add_parser("attach", help="Attach to a native Claude agent")
-    attach.add_argument("identifier")
+    attach.add_argument("identifier", type=_attach_identifier)
 
 
 def handle_cli(args: argparse.Namespace) -> int:
@@ -32,7 +38,8 @@ def handle_cli(args: argparse.Namespace) -> int:
     if args.claude_command == "attach":
         argv.append(args.identifier)
     try:
-        return subprocess.run(argv, shell=False, check=False).returncode
+        returncode = subprocess.run(argv, shell=False, check=False).returncode
+        return returncode if returncode >= 0 else 128 - returncode
     except OSError:
         print(
             "Claude CLI could not be started; check CLAUDE_BIN or the claude "

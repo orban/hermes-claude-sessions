@@ -52,6 +52,23 @@ def test_argparse_parses_agents_and_attach() -> None:
     }
 
 
+@pytest.mark.parametrize("identifier", ["--help", "-x"])
+def test_argparse_rejects_option_looking_attach_identifiers(identifier: str) -> None:
+    with pytest.raises(SystemExit) as error:
+        parser().parse_args(["attach", "--", identifier])
+    assert error.value.code == 2
+
+
+def test_argparse_help_and_unknown_command_exit_conventionally() -> None:
+    with pytest.raises(SystemExit) as help_exit:
+        parser().parse_args(["--help"])
+    assert help_exit.value.code == 0
+
+    with pytest.raises(SystemExit) as unknown_exit:
+        parser().parse_args(["unknown"])
+    assert unknown_exit.value.code == 2
+
+
 @pytest.mark.parametrize(
     ("args", "expected_argv"),
     [
@@ -126,6 +143,19 @@ def test_handler_returns_controlled_code_on_keyboard_interrupt(
     )
 
     assert cli.handle_cli(argparse.Namespace(claude_command="agents")) == 130
+
+
+def test_handler_translates_child_signal_to_shell_exit_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli, "resolve_claude_bin", lambda: "/mock/claude")
+    monkeypatch.setattr(
+        cli.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args[0], -15),
+    )
+
+    assert cli.handle_cli(argparse.Namespace(claude_command="agents")) == 143
 
 
 def test_registers_two_tools_one_hook_and_one_claude_cli_command() -> None:
