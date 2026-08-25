@@ -989,6 +989,47 @@ def test_cleanup_rejects_duplicate_exact_nonterminal_rows(
     assert confirmed is False
 
 
+def test_cleanup_accepts_exact_done_terminal_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session_id = "deadbeef-1111-4111-8111-111111111111"
+    owned = _OwnedProbe(
+        "observer-done-terminal",
+        "idle_prompt",
+        session_id,
+        "deadbeef",
+    )
+    terminal = {
+        "id": owned.display_id,
+        "sessionId": owned.session_id,
+        "name": owned.display_name,
+        "state": "done",
+    }
+    monkeypatch.setattr(
+        "hermes_claude_sessions.characterization._run_owned_observer_command",
+        lambda binary, owned, argv, cwd, timeout: CommandCapture(
+            argv, 0, "", "", False, None
+        ),
+    )
+    monkeypatch.setattr(
+        "hermes_claude_sessions.characterization._listing",
+        lambda *args: CommandCapture(
+            (EXACT_CLAUDE_BIN, "agents", "--json", "--all"),
+            0,
+            json.dumps([terminal]),
+            "",
+            False,
+            None,
+        ),
+    )
+
+    confirmed, _, _ = _cleanup_owned(
+        Path(EXACT_CLAUDE_BIN), owned, tmp_path, time.monotonic() + 1
+    )
+
+    assert confirmed is True
+
+
 def test_probe_fails_when_cleanup_listing_has_duplicate_exact_rows(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

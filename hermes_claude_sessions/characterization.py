@@ -73,6 +73,8 @@ WORKTREE_TIMEOUT_SECONDS = 15.0
 WORKTREE_SUITE_TIMEOUT_SECONDS = 75.0
 WORKTREE_CLEANUP_SECONDS = 8.0
 WORKTREE_DIFF_LIMIT = 8_192
+_TERMINAL_STATES = frozenset(("completed", "done", "failed", "stopped"))
+_SUCCESSFUL_TERMINAL_STATES = frozenset(("completed", "done"))
 
 
 class CharacterizationError(ValueError):
@@ -877,11 +879,7 @@ def _observe_exact_owned(
             if row is not None:
                 identity_seen = True
                 state = row.get("state")
-                completed = isinstance(state, str) and state in {
-                    "completed",
-                    "failed",
-                    "stopped",
-                }
+                completed = isinstance(state, str) and state in _TERMINAL_STATES
         observed |= _read_evidence(evidence)
         time.sleep(min(0.2, _remaining(observation_deadline)))
     return identity_seen, completed, observed
@@ -961,7 +959,7 @@ def _cleanup_owned(
                 and len(matches) == 1
                 and (
                     isinstance(matches[0].get("state"), str)
-                    and matches[0]["state"] in {"completed", "failed", "stopped"}
+                    and matches[0]["state"] in _TERMINAL_STATES
                 )
             )
             if absent or terminal:
@@ -1619,11 +1617,15 @@ def _observe_worktree_probe(
         hook_cwds = _evidence_cwds(evidence_directory)
         hook_effective = worktree_path if worktree_path in hook_cwds else None
         state = matches[0].get("state") if len(matches) == 1 else None
-        native_terminal = state in {"completed", "failed", "stopped"}
+        native_terminal = state in _TERMINAL_STATES
         observed_events = sorted(_read_evidence(evidence_directory))
-        if state == "completed" and worktree_path is not None and requested_edit_landed:
+        if (
+            state in _SUCCESSFUL_TERMINAL_STATES
+            and worktree_path is not None
+            and requested_edit_landed
+        ):
             probe_status = "observed"
-        elif state == "completed":
+        elif state in _SUCCESSFUL_TERMINAL_STATES:
             probe_status = "not_observed"
         else:
             probe_status = "probe_inconclusive"
@@ -1904,7 +1906,6 @@ LIFECYCLE_TIMEOUT_SECONDS = 10.0
 LIFECYCLE_SUITE_TIMEOUT_SECONDS = 70.0
 LIFECYCLE_CLEANUP_SECONDS = 10.0
 LIFECYCLE_POLL_SECONDS = 0.2
-_TERMINAL_STATES = frozenset(("completed", "failed", "stopped"))
 
 
 @dataclasses.dataclass(frozen=True)

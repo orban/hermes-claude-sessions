@@ -268,7 +268,7 @@ def test_observation_polls_until_exact_native_session_is_terminal(
 ) -> None:
     full = str(uuid.uuid4())
     probe = _WorktreeProbe("worktree-poll", full, full[:8])
-    states = iter(("running", "completed"))
+    states = iter(("running", "done"))
     calls = 0
 
     def listing(*args) -> CommandCapture:

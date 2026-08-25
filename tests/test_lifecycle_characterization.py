@@ -89,6 +89,7 @@ def test_daemon_classifier_recognizes_explicit_not_running_on_nonzero_exit() -> 
         ([], "stale"),
         ([{"state": "running"}], "active"),
         ([{"state": "blocked"}], "active"),
+        ([{"state": "done"}], "recoverable"),
         ([{"state": "stopped"}], "recoverable"),
         ([{"state": "failed"}], "recoverable"),
         ([{"state": "running"}, {"state": "stopped"}], "ambiguous"),
