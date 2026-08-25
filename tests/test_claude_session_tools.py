@@ -257,6 +257,28 @@ def test_list_returns_native_rows_unchanged_and_shell_free(
     }
 
 
+def test_list_rejects_oversized_success_without_truncating_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    oversized = [{"value": "x" * (tools.MAX_OUTPUT_CHARS + 1)}]
+    monkeypatch.setattr(tools, "resolve_claude_bin", lambda: "/mock/claude")
+    monkeypatch.setattr(
+        tools.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0], 0, json.dumps(oversized), ""
+        ),
+    )
+
+    result_text = tools.claude_session_list({})
+    result = decode(result_text)
+
+    assert result["ok"] is False
+    assert "too large" in result["error"].lower()
+    assert "x" * 100 not in result_text
+    assert len(result_text) <= tools.MAX_OUTPUT_CHARS
+
+
 @pytest.mark.parametrize("failure", ["unavailable", "timeout", "nonzero", "malformed"])
 def test_list_errors_are_controlled_json(
     monkeypatch: pytest.MonkeyPatch, failure: str
@@ -406,6 +428,80 @@ def test_approval_hook_only_requests_start_without_prompt() -> None:
     assert "plan" in approval["message"]
     assert hooks.pre_tool_call("claude_session_list", {}, task_id="ignored") is None
     assert hooks.pre_tool_call("other", {"prompt": prompt}, task_id="ignored") is None
+
+
+@pytest.mark.parametrize("alias", ["name", "cwd", "permission_mode"])
+def test_prompt_is_redacted_when_it_aliases_disclosed_fields(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, alias: str
+) -> None:
+    values = {
+        "name": "job",
+        "cwd": str(tmp_path),
+        "permission_mode": "manual",
+    }
+    prompt = values[alias]
+    args = {**values, "prompt": prompt}
+    monkeypatch.setattr(tools, "resolve_claude_bin", lambda: "/mock/claude")
+    monkeypatch.setattr(
+        tools.subprocess,
+        "run",
+        lambda *run_args, **kwargs: subprocess.CompletedProcess(run_args[0], 0, "", ""),
+    )
+
+    result = tools.claude_session_start(args)
+    approval = hooks.pre_tool_call("claude_session_start", args)
+
+    assert prompt not in result
+    assert approval is not None
+    assert prompt not in approval["message"]
+
+
+def test_prompt_substrings_are_redacted_from_disclosed_fields(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    prompt = "sensitive"
+    args = {
+        "name": "prefix-sensitive-suffix",
+        "cwd": str(tmp_path),
+        "prompt": prompt,
+        "permission_mode": "manual",
+    }
+    monkeypatch.setattr(tools, "resolve_claude_bin", lambda: "/mock/claude")
+    monkeypatch.setattr(
+        tools.subprocess,
+        "run",
+        lambda *run_args, **kwargs: subprocess.CompletedProcess(run_args[0], 0, "", ""),
+    )
+
+    result = tools.claude_session_start(args)
+    approval = hooks.pre_tool_call("claude_session_start", args)
+
+    assert prompt not in result
+    assert approval is not None
+    assert prompt not in approval["message"]
+
+
+def test_prompt_redaction_preserves_json_structure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    prompt = ","
+    args = {
+        "name": prompt,
+        "cwd": str(tmp_path),
+        "prompt": prompt,
+        "permission_mode": "manual",
+    }
+    monkeypatch.setattr(tools, "resolve_claude_bin", lambda: "/mock/claude")
+    monkeypatch.setattr(
+        tools.subprocess,
+        "run",
+        lambda *run_args, **kwargs: subprocess.CompletedProcess(run_args[0], 0, "", ""),
+    )
+
+    result = decode(tools.claude_session_start(args))
+
+    assert result["name"] == "<redacted>"
+    assert result["ok"] is True
 
 
 def test_registers_exactly_two_tools_and_one_pre_tool_hook() -> None:

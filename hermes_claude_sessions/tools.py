@@ -52,6 +52,26 @@ def _json(payload: dict[str, Any]) -> str:
     return json.dumps(payload)
 
 
+def _redact_prompt_value(value: Any, prompt: str) -> Any:
+    if isinstance(value, str):
+        return value.replace(prompt, _REDACTED_PROMPT)
+    if isinstance(value, list):
+        return [_redact_prompt_value(item, prompt) for item in value]
+    if isinstance(value, dict):
+        return {key: _redact_prompt_value(item, prompt) for key, item in value.items()}
+    return value
+
+
+def _redact_prompt_from_json(value: str, prompt: str | None) -> str:
+    if not prompt:
+        return value
+    try:
+        payload = json.loads(value)
+    except json.JSONDecodeError:
+        return _error("Claude session start returned malformed internal JSON")
+    return json.dumps(_redact_prompt_value(payload, prompt))
+
+
 def _error(message: str, **details: Any) -> str:
     return _json({"ok": False, "error": message, **details})
 
@@ -84,10 +104,16 @@ def _parse_start_args(args: object) -> tuple[str, str, Path, str] | str:
 def claude_session_start(args: object, **kwargs: object) -> str:
     """Start one native Claude background session without exposing its prompt."""
     del kwargs
+    prompt: str | None = None
     try:
-        return _claude_session_start(args)
+        if isinstance(args, Mapping):
+            candidate = args.get("prompt")
+            if isinstance(candidate, str):
+                prompt = candidate
+        result = _claude_session_start(args)
     except Exception:
-        return _error("Claude session start failed unexpectedly")
+        result = _error("Claude session start failed unexpectedly")
+    return _redact_prompt_from_json(result, prompt)
 
 
 def _claude_session_start(args: object) -> str:
@@ -193,6 +219,12 @@ def _claude_session_list() -> str:
             stdout=stdout,
             stderr=stderr,
         )
+    if len(completed.stdout) > MAX_OUTPUT_CHARS:
+        return _error(
+            "Claude session list is too large to return safely",
+            stdout="",
+            stderr=stderr,
+        )
     try:
         sessions = json.loads(completed.stdout)
     except (TypeError, json.JSONDecodeError):
@@ -205,4 +237,11 @@ def _claude_session_list() -> str:
             stdout=stdout,
             stderr=stderr,
         )
-    return _json({"ok": True, "sessions": sessions})
+    result = _json({"ok": True, "sessions": sessions})
+    if len(result) > MAX_OUTPUT_CHARS:
+        return _error(
+            "Claude session list is too large to return safely",
+            stdout="",
+            stderr=stderr,
+        )
+    return result
