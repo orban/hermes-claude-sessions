@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any, Protocol, runtime_checkable
 
-from . import hooks, schemas, tools
+from . import cli, hooks, schemas, tools
 
 
 @runtime_checkable
@@ -22,6 +22,15 @@ class PluginContext(Protocol):
     ) -> None: ...
 
     def register_hook(self, name: str, callback: Callable[..., Any]) -> None: ...
+
+    def register_cli_command(
+        self,
+        *,
+        name: str,
+        help: str,
+        setup_fn: Callable[..., Any],
+        handler_fn: Callable[..., int],
+    ) -> None: ...
 
 
 def register(ctx: object) -> None:
@@ -41,3 +50,9 @@ def register(ctx: object) -> None:
         handler=tools.claude_session_list,
     )
     ctx.register_hook("pre_tool_call", hooks.pre_tool_call)
+    ctx.register_cli_command(
+        name="claude",
+        help="Open native Claude agent views and attachments",
+        setup_fn=cli.setup_argparse,
+        handler_fn=cli.handle_cli,
+    )

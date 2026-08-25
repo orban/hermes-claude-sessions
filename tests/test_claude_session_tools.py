@@ -12,19 +12,23 @@ ROOT = Path(__file__).parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from hermes_claude_sessions import hooks, plugin, schemas, tools  # noqa: E402
+from hermes_claude_sessions import cli, hooks, plugin, schemas, tools  # noqa: E402
 
 
 class RecordingContext:
     def __init__(self) -> None:
         self.tools: list[dict[str, Any]] = []
         self.hooks: list[tuple[str, object]] = []
+        self.cli_commands: list[dict[str, object]] = []
 
     def register_tool(self, **kwargs: object) -> None:
         self.tools.append(dict(kwargs))
 
     def register_hook(self, name: str, callback: object) -> None:
         self.hooks.append((name, callback))
+
+    def register_cli_command(self, **kwargs: object) -> None:
+        self.cli_commands.append(dict(kwargs))
 
 
 def decode(result: str) -> dict[str, Any]:
@@ -522,6 +526,14 @@ def test_registers_exactly_two_tools_and_one_pre_tool_hook() -> None:
         schemas.CLAUDE_SESSION_LIST,
     ]
     assert context.hooks == [("pre_tool_call", hooks.pre_tool_call)]
+    assert context.cli_commands == [
+        {
+            "name": "claude",
+            "help": "Open native Claude agent views and attachments",
+            "setup_fn": cli.setup_argparse,
+            "handler_fn": cli.handle_cli,
+        }
+    ]
 
 
 def test_manifest_declares_exact_tools_and_hook() -> None:
