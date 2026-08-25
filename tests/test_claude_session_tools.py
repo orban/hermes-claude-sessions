@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -142,10 +143,15 @@ def test_start_accepts_each_allowed_mode(
 @pytest.mark.parametrize(
     "args,error",
     [
+        (None, "arguments must be an object"),
         ({"name": "", "cwd": "/", "prompt": "work"}, "name must be a non-empty string"),
         (
             {"name": "job", "cwd": "/", "prompt": ""},
             "prompt must be a non-empty string",
+        ),
+        (
+            {"name": "job", "cwd": 42, "prompt": "work"},
+            "cwd must be an absolute existing directory",
         ),
         (
             {"name": "job", "cwd": "relative", "prompt": "work"},
@@ -162,7 +168,7 @@ def test_start_accepts_each_allowed_mode(
     ],
 )
 def test_start_validation_errors_are_json(
-    monkeypatch: pytest.MonkeyPatch, args: dict[str, str], error: str
+    monkeypatch: pytest.MonkeyPatch, args: object, error: str
 ) -> None:
     monkeypatch.setattr(
         tools, "resolve_claude_bin", lambda: pytest.fail("should not resolve")
@@ -215,6 +221,55 @@ def test_resolver_precedence(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) ->
     local_binary.chmod(0o755)
     monkeypatch.setattr(tools.Path, "home", classmethod(lambda cls: tmp_path))
     assert tools.resolve_claude_bin() == str(local_binary)
+
+
+def test_resolver_returns_none_when_no_executable_exists(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("CLAUDE_BIN", str(tmp_path / "missing"))
+    monkeypatch.setattr(tools.shutil, "which", lambda _: None)
+    monkeypatch.setattr(tools.Path, "home", classmethod(lambda cls: tmp_path))
+
+    assert tools.resolve_claude_bin() is None
+
+
+def test_start_unavailable_and_oserror_are_controlled(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    args = {"name": "job", "cwd": str(tmp_path), "prompt": "secret"}
+    monkeypatch.setattr(tools, "resolve_claude_bin", lambda: None)
+
+    unavailable = decode(tools.claude_session_start(args))
+
+    assert unavailable["ok"] is False
+    assert "unavailable" in unavailable["error"].lower()
+    assert "secret" not in json.dumps(unavailable)
+
+    monkeypatch.setattr(tools, "resolve_claude_bin", lambda: "/mock/claude")
+    monkeypatch.setattr(
+        tools.subprocess,
+        "run",
+        lambda *run_args, **kwargs: (_ for _ in ()).throw(OSError("secret")),
+    )
+
+    os_error = decode(tools.claude_session_start(args))
+
+    assert os_error["ok"] is False
+    assert os_error["error"] == "Claude command could not be started"
+    assert "secret" not in json.dumps(os_error)
+
+
+def test_start_malformed_internal_result_is_controlled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(tools, "_claude_session_start", lambda args: "not-json")
+
+    result = decode(tools.claude_session_start({"prompt": "secret"}))
+
+    assert result == {
+        "ok": False,
+        "error": "Claude session start returned malformed internal JSON",
+    }
 
 
 def test_start_bounds_captured_output(
@@ -290,7 +345,52 @@ def test_list_rejects_oversized_success_without_truncating_rows(
     assert len(result_text) <= tools.MAX_OUTPUT_CHARS
 
 
-@pytest.mark.parametrize("failure", ["unavailable", "timeout", "nonzero", "malformed"])
+def test_list_rejects_success_that_expands_past_serialized_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rows = [{"value": "雪" * 2_000}]
+    native_json = json.dumps(rows, ensure_ascii=False)
+    assert len(native_json) < tools.MAX_OUTPUT_CHARS
+    monkeypatch.setattr(tools, "resolve_claude_bin", lambda: "/mock/claude")
+    monkeypatch.setattr(
+        tools.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0], 0, native_json, ""
+        ),
+    )
+
+    result_text = tools.claude_session_list({})
+    result = decode(result_text)
+
+    assert result["ok"] is False
+    assert "too large" in result["error"].lower()
+    assert len(result_text) <= tools.MAX_OUTPUT_CHARS
+
+
+def test_list_oserror_is_controlled(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(tools, "resolve_claude_bin", lambda: "/mock/claude")
+    monkeypatch.setattr(
+        tools.subprocess,
+        "run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("sensitive detail")),
+    )
+
+    result_text = tools.claude_session_list({})
+    result = decode(result_text)
+
+    assert result == {
+        "ok": False,
+        "error": "Claude command could not be started",
+        "stdout": "",
+        "stderr": "",
+    }
+    assert "sensitive detail" not in result_text
+
+
+@pytest.mark.parametrize(
+    "failure", ["unavailable", "timeout", "nonzero", "invalid_json", "nonlist"]
+)
 def test_list_errors_are_controlled_json(
     monkeypatch: pytest.MonkeyPatch, failure: str
 ) -> None:
@@ -313,6 +413,13 @@ def test_list_errors_are_controlled_json(
             lambda *args, **kwargs: subprocess.CompletedProcess(
                 args[0], 3, "out", "err"
             ),
+        )
+    elif failure == "invalid_json":
+        monkeypatch.setattr(tools, "resolve_claude_bin", lambda: "/mock/claude")
+        monkeypatch.setattr(
+            tools.subprocess,
+            "run",
+            lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, "{", ""),
         )
     else:
         monkeypatch.setattr(tools, "resolve_claude_bin", lambda: "/mock/claude")
@@ -439,6 +546,33 @@ def test_approval_hook_only_requests_start_without_prompt() -> None:
     assert "plan" in approval["message"]
     assert hooks.pre_tool_call("claude_session_list", {}, task_id="ignored") is None
     assert hooks.pre_tool_call("other", {"prompt": prompt}, task_id="ignored") is None
+
+
+def test_approval_hook_handles_unavailable_or_nonstring_metadata() -> None:
+    class BrokenMetadata(Mapping[str, object]):
+        def __getitem__(self, key: str) -> object:
+            raise RuntimeError("sensitive metadata failure")
+
+        def __iter__(self) -> Iterator[str]:
+            return iter(())
+
+        def __len__(self) -> int:
+            return 0
+
+    numeric = hooks.pre_tool_call(
+        "claude_session_start",
+        {"name": 1, "cwd": 2, "prompt": "secret", "permission_mode": 3},
+    )
+    unavailable = hooks.pre_tool_call("claude_session_start", BrokenMetadata())
+
+    assert numeric is not None
+    assert "name=1" in numeric["message"]
+    assert "cwd=2" in numeric["message"]
+    assert "permission_mode=3" in numeric["message"]
+    assert unavailable == {
+        "action": "approve",
+        "message": "Approve native Claude session start with unavailable metadata",
+    }
 
 
 @pytest.mark.parametrize("alias", ["name", "cwd", "permission_mode"])
