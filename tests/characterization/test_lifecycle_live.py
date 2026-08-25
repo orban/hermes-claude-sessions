@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from hermes_claude_sessions.characterization import (
+from tests.characterization.support import (
     EXACT_CLAUDE_BIN,
     CharacterizationError,
     collect_unattended_lifecycle_characterization,

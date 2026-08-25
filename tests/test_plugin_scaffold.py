@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+import tomllib
 from pathlib import Path
 from types import ModuleType
 
@@ -51,10 +52,27 @@ def test_root_entrypoint_exposes_plugin_register() -> None:
 
 def test_register_does_not_import_characterization() -> None:
     sys.modules.pop("hermes_claude_sessions.plugin", None)
-    sys.modules.pop("hermes_claude_sessions.characterization", None)
+    sys.modules.pop("tests.characterization.support", None)
 
     from hermes_claude_sessions.plugin import register
 
     register(object())
 
-    assert "hermes_claude_sessions.characterization" not in sys.modules
+    assert "tests.characterization.support" not in sys.modules
+
+
+def test_distribution_contains_only_runtime_package_at_manifest_version() -> None:
+    config = tomllib.loads((ROOT / "pyproject.toml").read_text())
+    manifest_version = next(
+        line.split(":", 1)[1].strip()
+        for line in (ROOT / "plugin.yaml").read_text().splitlines()
+        if line.startswith("version:")
+    )
+
+    assert config["project"]["version"] == manifest_version == "0.1.0"
+    discovery = config["tool"]["setuptools"]["packages"]["find"]
+    assert discovery["include"] == ["hermes_claude_sessions*"]
+    assert discovery["exclude"] == ["tests*", "skills*"]
+    assert discovery["namespaces"] is False
+    assert not (ROOT / "hermes_claude_sessions" / "characterization.py").exists()
+    assert (ROOT / "tests" / "characterization" / "support.py").is_file()

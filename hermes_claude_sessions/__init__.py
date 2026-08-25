@@ -1,1 +1,1 @@
-"""Safe, non-mutating Claude CLI contract characterization tools."""
+"""Lean Hermes adapter for Claude's native background-session supervisor."""

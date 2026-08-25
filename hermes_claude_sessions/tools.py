@@ -10,11 +10,12 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from .safety import without_prompt
+
 ALLOWED_PERMISSION_MODES = ("manual", "acceptEdits", "plan")
 COMMAND_TIMEOUT_SECONDS = 20
 MAX_OUTPUT_CHARS = 8_192
 _TRUNCATION_MARKER = "\n[truncated]"
-_REDACTED_PROMPT = "<redacted>"
 
 
 def _is_executable(path: Path) -> bool:
@@ -42,7 +43,7 @@ def resolve_claude_bin() -> str | None:
 def _bounded_output(value: str | None, prompt: str | None = None) -> str:
     output = value or ""
     if prompt:
-        output = output.replace(prompt, _REDACTED_PROMPT)
+        output = without_prompt(output, prompt)
     if len(output) <= MAX_OUTPUT_CHARS:
         return output
     return output[: MAX_OUTPUT_CHARS - len(_TRUNCATION_MARKER)] + _TRUNCATION_MARKER
@@ -54,7 +55,7 @@ def _json(payload: dict[str, Any]) -> str:
 
 def _redact_prompt_value(value: Any, prompt: str) -> Any:
     if isinstance(value, str):
-        return value.replace(prompt, _REDACTED_PROMPT)
+        return without_prompt(value, prompt)
     if isinstance(value, list):
         return [_redact_prompt_value(item, prompt) for item in value]
     if isinstance(value, dict):
@@ -69,7 +70,21 @@ def _redact_prompt_from_json(value: str, prompt: str | None) -> str:
         payload = json.loads(value)
     except json.JSONDecodeError:
         return _error("Claude session start returned malformed internal JSON")
-    return json.dumps(_redact_prompt_value(payload, prompt))
+    if not isinstance(payload, dict):
+        return _error("Claude session start returned malformed internal JSON")
+    redacted = _redact_prompt_value(payload, prompt)
+    result = json.dumps(redacted)
+    if len(result) <= MAX_OUTPUT_CHARS:
+        return result
+    compact: dict[str, Any] = {
+        "ok": redacted.get("ok") is True,
+        "output_omitted": True,
+    }
+    if isinstance(redacted.get("returncode"), int):
+        compact["returncode"] = redacted["returncode"]
+    if isinstance(redacted.get("error"), str):
+        compact["error"] = redacted["error"]
+    return _json(compact)
 
 
 def _error(message: str, **details: Any) -> str:

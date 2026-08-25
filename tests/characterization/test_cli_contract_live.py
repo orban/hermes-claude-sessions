@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from hermes_claude_sessions.characterization import (
+from tests.characterization.support import (
     REQUIRED_COMMANDS,
     REQUIRED_FLAGS,
     AcknowledgedClaudeBinary,

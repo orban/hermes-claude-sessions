@@ -5,11 +5,20 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
+from .safety import without_prompt
 
-def _without_prompt(value: Any, prompt: Any) -> Any:
-    if isinstance(value, str) and isinstance(prompt, str) and prompt:
-        return value.replace(prompt, "<redacted>")
-    return value
+MAX_APPROVAL_FIELD_CHARS = 2_048
+_TRUNCATION_MARKER = "...[truncated]"
+
+
+def _bounded_repr(value: Any, prompt: Any) -> str:
+    rendered = repr(without_prompt(value, prompt))
+    if len(rendered) <= MAX_APPROVAL_FIELD_CHARS:
+        return rendered
+    return (
+        rendered[: MAX_APPROVAL_FIELD_CHARS - len(_TRUNCATION_MARKER)]
+        + _TRUNCATION_MARKER
+    )
 
 
 def pre_tool_call(
@@ -21,13 +30,16 @@ def pre_tool_call(
         return None
     try:
         prompt = args.get("prompt")
-        name = _without_prompt(args.get("name"), prompt)
-        cwd = _without_prompt(args.get("cwd"), prompt)
-        mode = _without_prompt(args.get("permission_mode", "manual"), prompt)
         message = (
             "Approve native Claude session start: "
-            f"name={name!r}; cwd={cwd!r}; permission_mode={mode!r}"
+            f"name={_bounded_repr(args.get('name'), prompt)}; "
+            f"cwd={_bounded_repr(args.get('cwd'), prompt)}; "
+            "permission_mode="
+            f"{_bounded_repr(args.get('permission_mode', 'manual'), prompt)}"
         )
+        redacted_message = without_prompt(message, prompt)
+        if isinstance(redacted_message, str):
+            message = redacted_message
     except Exception:
         message = "Approve native Claude session start with unavailable metadata"
     return {"action": "approve", "message": message}

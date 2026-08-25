@@ -16,7 +16,7 @@ import pytest
 
 # Task 0B imports are intentionally separate: they specify the bounded,
 # opt-in observer-hook path without widening Task 0A's public command runner.
-from hermes_claude_sessions.characterization import (
+from tests.characterization.support import (
     EXACT_CLAUDE_BIN,
     MAX_OUTPUT_BYTES,
     OBSERVER_EVENT_MATCHERS,
@@ -229,7 +229,7 @@ def test_private_runner_deadline_includes_inherited_pipe_eof(tmp_path: Path) -> 
     )
     worker_code = (
         "import json, sys, threading\n"
-        "from hermes_claude_sessions.characterization import _run_command\n"
+        "from tests.characterization.support import _run_command\n"
         f"capture = _run_command([sys.executable, '-c', {parent_code!r}, "
         "sys.argv[1], sys.argv[2]], timeout_seconds=0.3)\n"
         "print(json.dumps({'timed_out': capture.timed_out, "
@@ -278,7 +278,7 @@ def test_private_runner_deadline_survives_escaped_pipe_holder(tmp_path: Path) ->
     )
     worker_code = (
         "import json, sys, threading\n"
-        "from hermes_claude_sessions.characterization import _run_command\n"
+        "from tests.characterization.support import _run_command\n"
         f"capture = _run_command([sys.executable, '-c', {parent_code!r}, "
         "sys.argv[1], sys.argv[2]], timeout_seconds=0.3)\n"
         "open(sys.argv[3], 'w').write(json.dumps({"
@@ -454,7 +454,7 @@ def test_collect_live_contract_sanitizes_every_capture(
             None,
         )
 
-    monkeypatch.setattr("hermes_claude_sessions.characterization.run_command", fake_run)
+    monkeypatch.setattr("tests.characterization.support.run_command", fake_run)
     contract = collect_live_contract(capability)
     serialized = json.dumps(contract)
     assert "raw prompt" not in serialized
@@ -465,9 +465,7 @@ def test_collect_live_contract_sanitizes_every_capture(
 def test_sanitize_text_handles_empty_user_lookup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(
-        "hermes_claude_sessions.characterization.getpass.getuser", lambda: ""
-    )
+    monkeypatch.setattr("tests.characterization.support.getpass.getuser", lambda: "")
     assert sanitize_text("safe output") == "safe output"
 
 
@@ -656,15 +654,15 @@ def test_unattended_probe_isolates_exact_uuid_cases_and_waits_before_stop(
 
     marker = object()
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._require_exact_observer_capability",
+        "tests.characterization.support._require_exact_observer_capability",
         fake_capability,
     )
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._run_owned_observer_command",
+        "tests.characterization.support._run_owned_observer_command",
         fake_owned_run,
     )
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._observe_exact_owned",
+        "tests.characterization.support._observe_exact_owned",
         lambda binary, owned, cwd, evidence, deadline: (False, False, set()),
     )
 
@@ -766,16 +764,16 @@ def test_every_post_launch_failure_still_stops_exact_launch_tokens(
         raise AssertionError(argv)
 
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._require_exact_observer_capability",
+        "tests.characterization.support._require_exact_observer_capability",
         lambda _: Path(EXACT_CLAUDE_BIN),
     )
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._run_owned_observer_command",
+        "tests.characterization.support._run_owned_observer_command",
         fake_run,
     )
     if failure == "identity_timeout":
         monkeypatch.setattr(
-            "hermes_claude_sessions.characterization._discover_native_identity",
+            "tests.characterization.support._discover_native_identity",
             lambda *args: None,
         )
     elif failure == "identity_ambiguity":
@@ -784,7 +782,7 @@ def test_every_post_launch_failure_still_stops_exact_launch_tokens(
             raise CharacterizationError("ambiguous native identity")
 
         monkeypatch.setattr(
-            "hermes_claude_sessions.characterization._discover_native_identity",
+            "tests.characterization.support._discover_native_identity",
             ambiguous,
         )
     else:
@@ -793,7 +791,7 @@ def test_every_post_launch_failure_still_stops_exact_launch_tokens(
             raise OSError("test-owned evidence unavailable")
 
         monkeypatch.setattr(
-            "hermes_claude_sessions.characterization._observe_exact_owned",
+            "tests.characterization.support._observe_exact_owned",
             observer_failure,
         )
 
@@ -835,15 +833,15 @@ def test_probe_fails_without_identity_readback_and_never_guesses_stop(
         return CommandCapture(argv, 0, "", "", False, None)
 
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._require_exact_observer_capability",
+        "tests.characterization.support._require_exact_observer_capability",
         lambda _: Path(EXACT_CLAUDE_BIN),
     )
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._run_owned_observer_command",
+        "tests.characterization.support._run_owned_observer_command",
         fake_run,
     )
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization.OBSERVER_SUITE_TIMEOUT_SECONDS",
+        "tests.characterization.support.OBSERVER_SUITE_TIMEOUT_SECONDS",
         0.5,
     )
     started = time.monotonic()
@@ -917,7 +915,7 @@ def test_identity_readback_rejects_noncanonical_or_missing_full_uuid(
     }
 
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._listing",
+        "tests.characterization.support._listing",
         lambda *args: CommandCapture(
             (EXACT_CLAUDE_BIN, "agents", "--json", "--all"),
             0,
@@ -927,9 +925,7 @@ def test_identity_readback_rejects_noncanonical_or_missing_full_uuid(
             None,
         ),
     )
-    monkeypatch.setattr(
-        "hermes_claude_sessions.characterization.time.sleep", lambda _: None
-    )
+    monkeypatch.setattr("tests.characterization.support.time.sleep", lambda _: None)
 
     assert (
         _discover_native_identity(
@@ -962,13 +958,13 @@ def test_cleanup_rejects_duplicate_exact_nonterminal_rows(
     }
 
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._run_owned_observer_command",
+        "tests.characterization.support._run_owned_observer_command",
         lambda binary, owned, argv, cwd, timeout: CommandCapture(
             argv, 0, "", "", False, None
         ),
     )
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._listing",
+        "tests.characterization.support._listing",
         lambda *args: CommandCapture(
             (EXACT_CLAUDE_BIN, "agents", "--json", "--all"),
             0,
@@ -978,9 +974,7 @@ def test_cleanup_rejects_duplicate_exact_nonterminal_rows(
             None,
         ),
     )
-    monkeypatch.setattr(
-        "hermes_claude_sessions.characterization.time.sleep", lambda _: None
-    )
+    monkeypatch.setattr("tests.characterization.support.time.sleep", lambda _: None)
 
     confirmed, _, _ = _cleanup_owned(
         Path(EXACT_CLAUDE_BIN), owned, tmp_path, time.monotonic() + 0.01
@@ -1006,13 +1000,13 @@ def test_cleanup_accepts_exact_done_terminal_state(
         "state": "done",
     }
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._run_owned_observer_command",
+        "tests.characterization.support._run_owned_observer_command",
         lambda binary, owned, argv, cwd, timeout: CommandCapture(
             argv, 0, "", "", False, None
         ),
     )
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._listing",
+        "tests.characterization.support._listing",
         lambda *args: CommandCapture(
             (EXACT_CLAUDE_BIN, "agents", "--json", "--all"),
             0,
@@ -1074,23 +1068,19 @@ def test_probe_fails_when_cleanup_listing_has_duplicate_exact_rows(
         raise AssertionError(argv)
 
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._require_exact_observer_capability",
+        "tests.characterization.support._require_exact_observer_capability",
         lambda _: Path(EXACT_CLAUDE_BIN),
     )
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._run_owned_observer_command",
+        "tests.characterization.support._run_owned_observer_command",
         fake_run,
     )
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._observe_exact_owned",
+        "tests.characterization.support._observe_exact_owned",
         lambda binary, owned, cwd, evidence, deadline: (True, False, set()),
     )
-    monkeypatch.setattr(
-        "hermes_claude_sessions.characterization.OBSERVER_CLEANUP_SECONDS", 0.01
-    )
-    monkeypatch.setattr(
-        "hermes_claude_sessions.characterization.time.sleep", lambda _: None
-    )
+    monkeypatch.setattr("tests.characterization.support.OBSERVER_CLEANUP_SECONDS", 0.01)
+    monkeypatch.setattr("tests.characterization.support.time.sleep", lambda _: None)
 
     with pytest.raises(CharacterizationError, match="cleanup could not be confirmed"):
         collect_unattended_observer_hook_characterization(
@@ -1142,26 +1132,24 @@ def test_post_launch_identity_timeout_preserves_cleanup_reserve(
         return CommandCapture(argv, 0, "", "", False, None)
 
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._require_exact_observer_capability",
+        "tests.characterization.support._require_exact_observer_capability",
         lambda _: Path(EXACT_CLAUDE_BIN),
     )
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._run_owned_observer_command",
+        "tests.characterization.support._run_owned_observer_command",
         fake_run,
     )
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._run_command_within_total_budget",
+        "tests.characterization.support._run_command_within_total_budget",
         lambda argv, total_timeout_seconds, cwd=None: CommandCapture(
             tuple(argv), 0, "", "", False, None
         ),
     )
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization.OBSERVER_SUITE_TIMEOUT_SECONDS", 13.0
+        "tests.characterization.support.OBSERVER_SUITE_TIMEOUT_SECONDS", 13.0
     )
-    monkeypatch.setattr(
-        "hermes_claude_sessions.characterization.time.monotonic", monotonic
-    )
-    monkeypatch.setattr("hermes_claude_sessions.characterization.time.sleep", sleep)
+    monkeypatch.setattr("tests.characterization.support.time.monotonic", monotonic)
+    monkeypatch.setattr("tests.characterization.support.time.sleep", sleep)
 
     with pytest.raises(CharacterizationError, match="failed identity read-back"):
         collect_unattended_observer_hook_characterization(
@@ -1246,23 +1234,21 @@ def test_hard_command_deadlines_leave_time_for_all_exact_observer_cleanup(
         return True, False, set()
 
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._require_exact_observer_capability",
+        "tests.characterization.support._require_exact_observer_capability",
         lambda _: Path(EXACT_CLAUDE_BIN),
     )
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._run_owned_observer_command",
+        "tests.characterization.support._run_owned_observer_command",
         fake_run,
     )
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._observe_exact_owned",
+        "tests.characterization.support._observe_exact_owned",
         slow_observation,
     )
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization.OBSERVER_SUITE_TIMEOUT_SECONDS", 2.0
+        "tests.characterization.support.OBSERVER_SUITE_TIMEOUT_SECONDS", 2.0
     )
-    monkeypatch.setattr(
-        "hermes_claude_sessions.characterization.OBSERVER_CLEANUP_SECONDS", 0.2
-    )
+    monkeypatch.setattr("tests.characterization.support.OBSERVER_CLEANUP_SECONDS", 0.2)
 
     started = time.monotonic()
     result = collect_unattended_observer_hook_characterization(

@@ -195,8 +195,80 @@ def test_start_never_returns_prompt_even_when_cli_echoes_it(
     )
 
     assert prompt not in result
-    assert decode(result)["stdout"] == "<redacted>"
-    assert decode(result)["stderr"] == "<redacted>"
+    assert decode(result)["stdout"] == ""
+    assert decode(result)["stderr"] == ""
+
+
+def test_prompt_redaction_sentinel_cannot_alias_prompt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    prompt = "<redacted>"
+    args = {"name": prompt, "cwd": str(tmp_path), "prompt": prompt}
+    monkeypatch.setattr(tools, "resolve_claude_bin", lambda: "/mock/claude")
+    monkeypatch.setattr(
+        tools.subprocess,
+        "run",
+        lambda *run_args, **kwargs: subprocess.CompletedProcess(
+            run_args[0], 0, prompt, prompt
+        ),
+    )
+
+    result = tools.claude_session_start(args)
+    approval = hooks.pre_tool_call("claude_session_start", args)
+
+    assert prompt not in result
+    assert approval is not None
+    assert prompt not in approval["message"]
+
+
+def test_start_result_and_approval_have_total_bounds(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    args = {
+        "name": "n" * (tools.MAX_OUTPUT_CHARS + 2_000),
+        "cwd": str(tmp_path),
+        "prompt": "private work",
+        "permission_mode": "manual",
+    }
+    monkeypatch.setattr(tools, "resolve_claude_bin", lambda: "/mock/claude")
+    monkeypatch.setattr(
+        tools.subprocess,
+        "run",
+        lambda *run_args, **kwargs: subprocess.CompletedProcess(
+            run_args[0], 0, "o" * tools.MAX_OUTPUT_CHARS, "e" * tools.MAX_OUTPUT_CHARS
+        ),
+    )
+
+    result_text = tools.claude_session_start(args)
+    result = decode(result_text)
+    approval = hooks.pre_tool_call("claude_session_start", args)
+
+    assert len(result_text) <= tools.MAX_OUTPUT_CHARS
+    assert result == {
+        "ok": True,
+        "returncode": 0,
+        "output_omitted": True,
+    }
+    monkeypatch.setattr(
+        tools.subprocess,
+        "run",
+        lambda *run_args, **kwargs: subprocess.CompletedProcess(
+            run_args[0], 9, "o" * tools.MAX_OUTPUT_CHARS, "e" * tools.MAX_OUTPUT_CHARS
+        ),
+    )
+    failure_text = tools.claude_session_start(args)
+    assert len(failure_text) <= tools.MAX_OUTPUT_CHARS
+    assert decode(failure_text) == {
+        "ok": False,
+        "returncode": 9,
+        "output_omitted": True,
+        "error": "Claude command exited with a non-zero status",
+    }
+    assert approval is not None
+    assert len(approval["message"]) <= tools.MAX_OUTPUT_CHARS
+    assert "name=" in approval["message"]
+    assert "cwd=" in approval["message"]
+    assert "permission_mode=" in approval["message"]
 
 
 def test_resolver_precedence(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -284,16 +356,17 @@ def test_start_bounds_captured_output(
         ),
     )
 
-    result = decode(
-        tools.claude_session_start(
-            {"name": "job", "cwd": str(tmp_path), "prompt": "work"}
-        )
+    result_text = tools.claude_session_start(
+        {"name": "job", "cwd": str(tmp_path), "prompt": "work"}
     )
+    result = decode(result_text)
 
-    assert len(result["stdout"]) <= tools.MAX_OUTPUT_CHARS
-    assert len(result["stderr"]) <= tools.MAX_OUTPUT_CHARS
-    assert result["stdout"].endswith("[truncated]")
-    assert result["stderr"].endswith("[truncated]")
+    assert len(result_text) <= tools.MAX_OUTPUT_CHARS
+    assert result == {
+        "ok": True,
+        "returncode": 0,
+        "output_omitted": True,
+    }
 
 
 def test_list_returns_native_rows_unchanged_and_shell_free(
@@ -701,7 +774,7 @@ def test_prompt_redaction_preserves_json_structure(
 
     result = decode(tools.claude_session_start(args))
 
-    assert result["name"] == "<redacted>"
+    assert result["name"] == ""
     assert result["ok"] is True
 
 

@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from hermes_claude_sessions.characterization import (
+from tests.characterization.support import (
     EXACT_CLAUDE_BIN,
     WORKTREE_CLEANUP_SECONDS,
     WORKTREE_DIFF_LIMIT,
@@ -79,19 +79,19 @@ def _configure(
     duplicate: bool = False,
 ) -> None:
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._require_exact_observer_capability",
+        "tests.characterization.support._require_exact_observer_capability",
         lambda _: Path(EXACT_CLAUDE_BIN),
     )
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._run_owned_worktree_command",
+        "tests.characterization.support._run_owned_worktree_command",
         _runner(rows, calls, duplicate),
     )
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._worktree_snapshot",
+        "tests.characterization.support._worktree_snapshot",
         lambda *args: "worktree /private/tmp/main\n",
     )
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._initialize_seed_repository",
+        "tests.characterization.support._initialize_seed_repository",
         lambda repository, deadline: (repository / "seed.txt").write_text("seed\n"),
     )
 
@@ -186,10 +186,10 @@ def test_observation_rejects_duplicate_paths_in_either_snapshot(
         )
 
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._run_owned_worktree_command", listing
+        "tests.characterization.support._run_owned_worktree_command", listing
     )
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._worktree_snapshot",
+        "tests.characterization.support._worktree_snapshot",
         lambda *args: duplicate if duplicate_stage == "after" else valid,
     )
     with pytest.raises(CharacterizationError, match="worktree porcelain"):
@@ -251,7 +251,7 @@ def test_identity_reconciliation_requires_launch_returned_short_token(
         )
 
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._run_owned_worktree_command",
+        "tests.characterization.support._run_owned_worktree_command",
         mismatched_listing,
     )
     discovered = _discover_worktree_identity(
@@ -297,10 +297,10 @@ def test_observation_polls_until_exact_native_session_is_terminal(
 
     (tmp_path / "seed.txt").write_text("seed\n")
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._run_owned_worktree_command", listing
+        "tests.characterization.support._run_owned_worktree_command", listing
     )
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._worktree_snapshot",
+        "tests.characterization.support._worktree_snapshot",
         lambda *args: f"worktree {tmp_path}\n",
     )
     result = _observe_worktree_probe(
@@ -349,7 +349,7 @@ def test_cleanup_accepts_done_after_successful_stop(
         raise AssertionError(argv)
 
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._run_owned_worktree_command", runner
+        "tests.characterization.support._run_owned_worktree_command", runner
     )
 
     assert _worktree_cleanup(
@@ -373,7 +373,7 @@ def test_identity_finally_cleanup_sanitization_and_unrelated_preservation(
     calls: list[tuple[str, ...]] = []
     _configure(monkeypatch, rows, calls)
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._observe_worktree_probe",
+        "tests.characterization.support._observe_worktree_probe",
         lambda *args: {
             "effective_cwd": "/private/tmp/worktree",
             "effective_cwd_source": "hook",
@@ -405,7 +405,7 @@ def test_sanitized_observation_is_archived_before_cleanup_even_when_cleanup_fail
     writes: list[dict[str, object]] = []
     _configure(monkeypatch, rows, calls)
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._observe_worktree_probe",
+        "tests.characterization.support._observe_worktree_probe",
         lambda *args: {
             "probe_status": "probe_inconclusive",
             "worktree_path": "/private/tmp/owned",
@@ -423,14 +423,12 @@ def test_sanitized_observation_is_archived_before_cleanup_even_when_cleanup_fail
         events.append("cleanup")
         return False
 
+    monkeypatch.setattr("tests.characterization.support.atomic_write_contract", archive)
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization.atomic_write_contract", archive
+        "tests.characterization.support._worktree_cleanup", fail_cleanup
     )
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._worktree_cleanup", fail_cleanup
-    )
-    monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._preserve_worktree_diagnostics",
+        "tests.characterization.support._preserve_worktree_diagnostics",
         lambda root: tmp_path / "preserved",
     )
 
@@ -459,7 +457,7 @@ def test_observation_error_is_archived_before_exact_cleanup(
     writes: list[dict[str, object]] = []
     _configure(monkeypatch, rows, calls)
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._observe_worktree_probe",
+        "tests.characterization.support._observe_worktree_probe",
         lambda *args: (_ for _ in ()).throw(TimeoutError()),
     )
 
@@ -472,11 +470,9 @@ def test_observation_error_is_archived_before_exact_cleanup(
         events.append("cleanup")
         return True
 
+    monkeypatch.setattr("tests.characterization.support.atomic_write_contract", archive)
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization.atomic_write_contract", archive
-    )
-    monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._worktree_cleanup", confirm_cleanup
+        "tests.characterization.support._worktree_cleanup", confirm_cleanup
     )
 
     with pytest.raises(CharacterizationError, match="observation failed: TimeoutError"):
@@ -496,9 +492,7 @@ def test_setup_cannot_consume_cleanup_reserve_or_begin_launch(
     calls: list[tuple[str, ...]] = []
     now = [100.0]
     _configure(monkeypatch, rows, calls)
-    monkeypatch.setattr(
-        "hermes_claude_sessions.characterization.time.monotonic", lambda: now[0]
-    )
+    monkeypatch.setattr("tests.characterization.support.time.monotonic", lambda: now[0])
 
     def consume_work_budget(repository: Path, deadline: float) -> None:
         (repository / "seed.txt").write_text("seed\n")
@@ -508,7 +502,7 @@ def test_setup_cannot_consume_cleanup_reserve_or_begin_launch(
         now[0] = deadline
 
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._initialize_seed_repository",
+        "tests.characterization.support._initialize_seed_repository",
         consume_work_budget,
     )
 
@@ -536,14 +530,14 @@ def test_post_stop_artifact_preservation_is_observed_not_inferred(
         )
     )
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._worktree_snapshot",
+        "tests.characterization.support._worktree_snapshot",
         lambda *args: next(snapshots),
     )
     owned = tmp_path / "owned"
     owned.mkdir()
     (owned / "seed.txt").write_text("seed\nCHARACTERIZATION_EDIT\n")
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._worktree_paths",
+        "tests.characterization.support._worktree_paths",
         lambda porcelain: (
             {str(tmp_path / "main"): None, str(owned): "refs/heads/probe"}
             if "owned" in porcelain
@@ -551,7 +545,7 @@ def test_post_stop_artifact_preservation_is_observed_not_inferred(
         ),
     )
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._run_git",
+        "tests.characterization.support._run_git",
         lambda argv, *args: CommandCapture(
             argv, 0, "+CHARACTERIZATION_EDIT\n", "", False, None
         ),
@@ -574,7 +568,7 @@ def test_post_stop_integrity_is_unknown_when_not_observed(
     writes: list[dict[str, object]] = []
     _configure(monkeypatch, rows, calls)
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._observe_worktree_probe",
+        "tests.characterization.support._observe_worktree_probe",
         lambda *args: {
             "probe_status": "probe_inconclusive",
             "worktree_path": "/private/tmp/owned",
@@ -583,16 +577,16 @@ def test_post_stop_integrity_is_unknown_when_not_observed(
         },
     )
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization.atomic_write_contract",
+        "tests.characterization.support.atomic_write_contract",
         lambda destination, contract: writes.append(contract),
     )
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._preserve_worktree_diagnostics",
+        "tests.characterization.support._preserve_worktree_diagnostics",
         lambda root: tmp_path / "preserved",
     )
     if failure == "cleanup":
         monkeypatch.setattr(
-            "hermes_claude_sessions.characterization._worktree_cleanup",
+            "tests.characterization.support._worktree_cleanup",
             lambda *args: False,
         )
     else:
@@ -606,7 +600,7 @@ def test_post_stop_integrity_is_unknown_when_not_observed(
             return "worktree /private/tmp/main\n"
 
         monkeypatch.setattr(
-            "hermes_claude_sessions.characterization._worktree_snapshot",
+            "tests.characterization.support._worktree_snapshot",
             fail_post_snapshot,
         )
 
@@ -654,16 +648,16 @@ def test_observed_diff_is_bounded(
         )
 
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._run_owned_worktree_command", listing
+        "tests.characterization.support._run_owned_worktree_command", listing
     )
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._worktree_snapshot",
+        "tests.characterization.support._worktree_snapshot",
         lambda *args: (
             f"worktree {tmp_path}\n\nworktree {owned}\nbranch refs/heads/probe\n"
         ),
     )
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._run_git",
+        "tests.characterization.support._run_git",
         lambda argv, *args: CommandCapture(
             argv, 0, "x" * (WORKTREE_DIFF_LIMIT + 100), "", False, None
         ),
@@ -688,12 +682,12 @@ def test_finally_stops_exact_token_after_timeout_or_observation_error(
     _configure(monkeypatch, rows, calls)
     if fault == "identity":
         monkeypatch.setattr(
-            "hermes_claude_sessions.characterization._discover_worktree_identity",
+            "tests.characterization.support._discover_worktree_identity",
             lambda *args: None,
         )
     else:
         monkeypatch.setattr(
-            "hermes_claude_sessions.characterization._observe_worktree_probe",
+            "tests.characterization.support._observe_worktree_probe",
             lambda *args: (_ for _ in ()).throw(TimeoutError()),
         )
     with pytest.raises(CharacterizationError):
@@ -732,11 +726,11 @@ def test_missing_launch_token_fails_without_guessing_stop(
         return capture
 
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._run_owned_worktree_command",
+        "tests.characterization.support._run_owned_worktree_command",
         no_token,
     )
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._preserve_worktree_diagnostics",
+        "tests.characterization.support._preserve_worktree_diagnostics",
         lambda root: tmp_path / "preserved",
     )
     with pytest.raises(CharacterizationError, match="omitted exact cleanup token"):

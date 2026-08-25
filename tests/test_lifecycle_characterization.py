@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from hermes_claude_sessions.characterization import (
+from tests.characterization.support import (
     EXACT_CLAUDE_BIN,
     CharacterizationError,
     CommandCapture,
@@ -110,7 +110,7 @@ def test_lifecycle_roster_snapshot_rejects_malformed_json_structures(
 ) -> None:
     probe = _LifecycleProbe("lifecycle-test", "deadbeef")
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._lifecycle_listing",
+        "tests.characterization.support._lifecycle_listing",
         lambda *args: CommandCapture(
             (EXACT_CLAUDE_BIN, "agents", "--json", "--all"),
             0,
@@ -137,7 +137,7 @@ def test_tokenless_recovery_rejects_malformed_roster_structures(
 ) -> None:
     probe = _LifecycleProbe("lifecycle-test", "deadbeef")
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._lifecycle_listing",
+        "tests.characterization.support._lifecycle_listing",
         lambda *args: CommandCapture(
             (EXACT_CLAUDE_BIN, "agents", "--json", "--all"),
             0,
@@ -245,15 +245,13 @@ def test_lifecycle_probe_reconciles_exact_identity_exercises_identifiers_and_cle
         return CommandCapture(argv, 0, "", "", False, None)
 
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._require_exact_observer_capability",
+        "tests.characterization.support._require_exact_observer_capability",
         lambda _: Path(EXACT_CLAUDE_BIN),
     )
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._run_owned_lifecycle_command", run
+        "tests.characterization.support._run_owned_lifecycle_command", run
     )
-    monkeypatch.setattr(
-        "hermes_claude_sessions.characterization.LIFECYCLE_POLL_SECONDS", 0.0
-    )
+    monkeypatch.setattr("tests.characterization.support.LIFECYCLE_POLL_SECONDS", 0.0)
     artifact = tmp_path / "lifecycle.json"
     result = collect_unattended_lifecycle_characterization(object(), artifact)
 
@@ -286,30 +284,30 @@ def test_lifecycle_archive_precedes_finally_cleanup_and_cleanup_runs_after_error
         "lifecycle-test", "deadbeef", "deadbeef-1111-4111-8111-111111111111"
     )
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._require_exact_observer_capability",
+        "tests.characterization.support._require_exact_observer_capability",
         lambda _: Path(EXACT_CLAUDE_BIN),
     )
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._initialize_seed_repository",
+        "tests.characterization.support._initialize_seed_repository",
         lambda *args: None,
     )
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._lifecycle_listing",
+        "tests.characterization.support._lifecycle_listing",
         lambda *args: CommandCapture(
             (EXACT_CLAUDE_BIN, "agents", "--json", "--all"), 0, "[]", "", False, None
         ),
     )
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._mint_lifecycle_probe", lambda: probe
+        "tests.characterization.support._mint_lifecycle_probe", lambda: probe
     )
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._run_owned_lifecycle_command",
+        "tests.characterization.support._run_owned_lifecycle_command",
         lambda *args: CommandCapture(
             (EXACT_CLAUDE_BIN, "--bg"), 1, "", "", False, None
         ),
     )
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization.atomic_write_contract",
+        "tests.characterization.support.atomic_write_contract",
         lambda *args: events.append("archive"),
     )
     with pytest.raises(CharacterizationError, match="background launch failed"):
@@ -325,30 +323,30 @@ def test_each_exploratory_mutation_is_archived_before_execution(
     probe = _LifecycleProbe("lifecycle-test", "deadbeef", full)
 
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._require_exact_observer_capability",
+        "tests.characterization.support._require_exact_observer_capability",
         lambda _: Path(EXACT_CLAUDE_BIN),
     )
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._initialize_seed_repository",
+        "tests.characterization.support._initialize_seed_repository",
         lambda *args: None,
     )
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._mint_lifecycle_probe", lambda: probe
+        "tests.characterization.support._mint_lifecycle_probe", lambda: probe
     )
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._reconcile_lifecycle_identity",
+        "tests.characterization.support._reconcile_lifecycle_identity",
         lambda *args: probe,
     )
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._transition_to_terminal",
+        "tests.characterization.support._transition_to_terminal",
         lambda *args: "observed",
     )
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._lifecycle_cleanup",
+        "tests.characterization.support._lifecycle_cleanup",
         lambda *args: True,
     )
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization.atomic_write_contract",
+        "tests.characterization.support.atomic_write_contract",
         lambda _path, payload: events.append(
             f"archive:{payload.get('pending_mutation', 'final')}"
         ),
@@ -383,7 +381,7 @@ def test_each_exploratory_mutation_is_archived_before_execution(
         return CommandCapture(argv, 0, stdout, "", False, None)
 
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._run_owned_lifecycle_command", run
+        "tests.characterization.support._run_owned_lifecycle_command", run
     )
     collect_unattended_lifecycle_characterization(object(), tmp_path / "out.json")
 
@@ -415,18 +413,18 @@ def test_missing_respawn_token_recovers_exact_replacement_for_cleanup(
     stop_targets: list[str] = []
 
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._require_exact_observer_capability",
+        "tests.characterization.support._require_exact_observer_capability",
         lambda _: Path(EXACT_CLAUDE_BIN),
     )
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._initialize_seed_repository",
+        "tests.characterization.support._initialize_seed_repository",
         lambda *args: None,
     )
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._mint_lifecycle_probe", lambda: minted
+        "tests.characterization.support._mint_lifecycle_probe", lambda: minted
     )
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._transition_to_terminal",
+        "tests.characterization.support._transition_to_terminal",
         lambda *args: "observed",
     )
 
@@ -475,7 +473,7 @@ def test_missing_respawn_token_recovers_exact_replacement_for_cleanup(
         raise AssertionError(argv)
 
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._run_owned_lifecycle_command", run
+        "tests.characterization.support._run_owned_lifecycle_command", run
     )
     result = collect_unattended_lifecycle_characterization(
         object(), tmp_path / "out.json"
@@ -496,18 +494,18 @@ def test_new_respawn_token_is_the_final_cleanup_capability_on_ambiguity(
     respawned = False
 
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._require_exact_observer_capability",
+        "tests.characterization.support._require_exact_observer_capability",
         lambda _: Path(EXACT_CLAUDE_BIN),
     )
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._initialize_seed_repository",
+        "tests.characterization.support._initialize_seed_repository",
         lambda *args: None,
     )
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._mint_lifecycle_probe", lambda: probe
+        "tests.characterization.support._mint_lifecycle_probe", lambda: probe
     )
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._transition_to_terminal",
+        "tests.characterization.support._transition_to_terminal",
         lambda *args: "observed",
     )
 
@@ -573,7 +571,7 @@ def test_new_respawn_token_is_the_final_cleanup_capability_on_ambiguity(
         return CommandCapture(argv, 0, "", "", False, None)
 
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._run_owned_lifecycle_command", run
+        "tests.characterization.support._run_owned_lifecycle_command", run
     )
     with pytest.raises(
         CharacterizationError, match="ambiguous lifecycle native identity"
@@ -648,7 +646,7 @@ def test_lifecycle_cleanup_rejects_malformed_or_duplicate_owned_candidates(
         return CommandCapture(argv, 0, json.dumps(owned_rows), "", False, None)
 
     monkeypatch.setattr(
-        "hermes_claude_sessions.characterization._run_owned_lifecycle_command", run
+        "tests.characterization.support._run_owned_lifecycle_command", run
     )
     assert not _lifecycle_cleanup(
         Path(EXACT_CLAUDE_BIN), probe, tmp_path, time.monotonic() + 1
