@@ -1,0 +1,102 @@
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+from hermes_claude_sessions import plugin
+
+ROOT = Path(__file__).parents[1]
+SKILL_PATH = ROOT / "skills" / "native-claude-sessions" / "SKILL.md"
+README_PATH = ROOT / "README.md"
+
+
+class RecordingContext:
+    def __init__(self) -> None:
+        self.tools: list[dict[str, Any]] = []
+        self.hooks: list[tuple[str, object]] = []
+        self.cli_commands: list[dict[str, object]] = []
+        self.skills: list[dict[str, object]] = []
+
+    def register_tool(self, **kwargs: object) -> None:
+        self.tools.append(dict(kwargs))
+
+    def register_hook(self, name: str, callback: object) -> None:
+        self.hooks.append((name, callback))
+
+    def register_cli_command(self, **kwargs: object) -> None:
+        self.cli_commands.append(dict(kwargs))
+
+    def register_skill(self, name: str, path: Path, description: str = "") -> None:
+        self.skills.append({"name": name, "path": path, "description": description})
+
+
+def _frontmatter(text: str) -> dict[str, str]:
+    assert text.startswith("---\n")
+    _, raw, _ = text.split("---\n", 2)
+    result: dict[str, str] = {}
+    for line in raw.splitlines():
+        key, value = line.split(": ", 1)
+        result[key] = value.strip('"')
+    return result
+
+
+def test_registers_exactly_one_bundled_operating_skill() -> None:
+    context = RecordingContext()
+
+    plugin.register(context)
+
+    assert context.skills == [
+        {
+            "name": "native-claude-sessions",
+            "path": SKILL_PATH,
+            "description": "Use when operating native Claude background sessions.",
+        }
+    ]
+    assert SKILL_PATH.is_file()
+    assert context.skills[0]["path"].resolve() == SKILL_PATH.resolve()
+
+
+def test_operating_skill_has_valid_frontmatter_and_safety_boundaries() -> None:
+    text = SKILL_PATH.read_text(encoding="utf-8")
+    frontmatter = _frontmatter(text)
+
+    assert frontmatter["name"] == "native-claude-sessions"
+    assert frontmatter["description"].startswith(
+        "Use when operating native Claude background sessions"
+    )
+    for required in (
+        "claude_session_start",
+        "claude_session_list",
+        "hermes claude agents",
+        "hermes claude attach <id>",
+        "Never bypass permissions",
+        "Never infer state from terminal text",
+        "do not retry paid launches automatically",
+        "zmx",
+    ):
+        assert required.lower() in text.lower()
+
+
+def test_readme_documents_ownership_handoffs_and_non_goals() -> None:
+    text = README_PATH.read_text(encoding="utf-8")
+
+    for required in (
+        "claude_session_start",
+        "claude_session_list",
+        "hermes claude agents",
+        "hermes claude attach <id>",
+        "claude-sessions:native-claude-sessions",
+        "CLAUDE_BIN",
+        "PATH",
+        "~/.local/bin/claude",
+        "$HERMES_HOME/plugins/claude-sessions",
+        "hermes plugins doctor . --ci",
+        "screen scraping",
+        "keystroke injection",
+        "bypassPermissions",
+        "persistence/reconciliation/stop/respawn/cleanup",
+        "zmx fallback only",
+        "opt-in",
+        "cost",
+    ):
+        assert required.lower() in text.lower()

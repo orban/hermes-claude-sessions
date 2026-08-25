@@ -19,6 +19,7 @@ class RecordingContext:
     def __init__(self) -> None:
         self.tools: list[dict[str, Any]] = []
         self.hooks: list[tuple[str, object]] = []
+        self.skills: list[tuple[str, Path, str]] = []
         self.cli_commands: list[dict[str, object]] = []
 
     def register_tool(self, **kwargs: object) -> None:
@@ -26,6 +27,9 @@ class RecordingContext:
 
     def register_hook(self, name: str, callback: object) -> None:
         self.hooks.append((name, callback))
+
+    def register_skill(self, name: str, path: Path, description: str = "") -> None:
+        self.skills.append((name, path, description))
 
     def register_cli_command(self, **kwargs: object) -> None:
         self.cli_commands.append(dict(kwargs))

@@ -3,9 +3,18 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
 from . import cli, hooks, schemas, tools
+
+_SKILL_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "skills"
+    / "native-claude-sessions"
+    / "SKILL.md"
+)
+_SKILL_DESCRIPTION = "Use when operating native Claude background sessions."
 
 
 @runtime_checkable
@@ -22,6 +31,8 @@ class PluginContext(Protocol):
     ) -> None: ...
 
     def register_hook(self, name: str, callback: Callable[..., Any]) -> None: ...
+
+    def register_skill(self, name: str, path: Path, description: str = "") -> None: ...
 
     def register_cli_command(
         self,
@@ -50,6 +61,7 @@ def register(ctx: object) -> None:
         handler=tools.claude_session_list,
     )
     ctx.register_hook("pre_tool_call", hooks.pre_tool_call)
+    ctx.register_skill("native-claude-sessions", _SKILL_PATH, _SKILL_DESCRIPTION)
     ctx.register_cli_command(
         name="claude",
         help="Open native Claude agent views and attachments",
