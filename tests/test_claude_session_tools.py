@@ -388,6 +388,62 @@ def test_list_oserror_is_controlled(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "sensitive detail" not in result_text
 
 
+def test_list_nonzero_error_has_total_response_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(tools, "resolve_claude_bin", lambda: "/mock/claude")
+    monkeypatch.setattr(
+        tools.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0],
+            7,
+            "o" * tools.MAX_OUTPUT_CHARS,
+            "雪" * tools.MAX_OUTPUT_CHARS,
+        ),
+    )
+
+    result_text = tools.claude_session_list({})
+    result = decode(result_text)
+
+    assert len(result_text) <= tools.MAX_OUTPUT_CHARS
+    assert result == {
+        "ok": False,
+        "error": "Claude command exited with a non-zero status",
+        "returncode": 7,
+        "output_omitted": True,
+    }
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        "{" + "雪" * 1_000,
+        json.dumps("雪" * 1_000, ensure_ascii=False),
+    ],
+)
+def test_list_parse_errors_have_total_response_bound(
+    monkeypatch: pytest.MonkeyPatch, stdout: str
+) -> None:
+    monkeypatch.setattr(tools, "resolve_claude_bin", lambda: "/mock/claude")
+    monkeypatch.setattr(
+        tools.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0], 0, stdout, "雪" * tools.MAX_OUTPUT_CHARS
+        ),
+    )
+
+    result_text = tools.claude_session_list({})
+    result = decode(result_text)
+
+    assert len(result_text) <= tools.MAX_OUTPUT_CHARS
+    assert result["ok"] is False
+    assert result["output_omitted"] is True
+    assert "stdout" not in result
+    assert "stderr" not in result
+
+
 @pytest.mark.parametrize(
     "failure", ["unavailable", "timeout", "nonzero", "invalid_json", "nonlist"]
 )

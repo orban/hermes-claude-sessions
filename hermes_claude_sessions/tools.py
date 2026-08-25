@@ -76,6 +76,16 @@ def _error(message: str, **details: Any) -> str:
     return _json({"ok": False, "error": message, **details})
 
 
+def _list_error(message: str, **details: Any) -> str:
+    result = _error(message, **details)
+    if len(result) <= MAX_OUTPUT_CHARS:
+        return result
+    compact: dict[str, Any] = {"output_omitted": True}
+    if isinstance(details.get("returncode"), int):
+        compact["returncode"] = details["returncode"]
+    return _error(message, **compact)
+
+
 def _parse_start_args(args: object) -> tuple[str, str, Path, str] | str:
     if not isinstance(args, Mapping):
         return _error("arguments must be an object")
@@ -189,7 +199,7 @@ def claude_session_list(args: object, **kwargs: object) -> str:
 def _claude_session_list() -> str:
     claude_bin = resolve_claude_bin()
     if claude_bin is None:
-        return _error(
+        return _list_error(
             "Claude CLI is unavailable; set CLAUDE_BIN or install an executable "
             "claude binary",
             stdout="",
@@ -206,14 +216,16 @@ def _claude_session_list() -> str:
             check=False,
         )
     except subprocess.TimeoutExpired:
-        return _error("Claude command timed out after 20 seconds", stdout="", stderr="")
+        return _list_error(
+            "Claude command timed out after 20 seconds", stdout="", stderr=""
+        )
     except OSError:
-        return _error("Claude command could not be started", stdout="", stderr="")
+        return _list_error("Claude command could not be started", stdout="", stderr="")
 
     stdout = _bounded_output(completed.stdout)
     stderr = _bounded_output(completed.stderr)
     if completed.returncode != 0:
-        return _error(
+        return _list_error(
             "Claude command exited with a non-zero status",
             returncode=completed.returncode,
             stdout=stdout,
@@ -224,11 +236,11 @@ def _claude_session_list() -> str:
     try:
         sessions = json.loads(completed.stdout)
     except (TypeError, json.JSONDecodeError):
-        return _error(
+        return _list_error(
             "Claude session list returned malformed JSON", stdout=stdout, stderr=stderr
         )
     if not isinstance(sessions, list):
-        return _error(
+        return _list_error(
             "Claude session list must be a top-level JSON list",
             stdout=stdout,
             stderr=stderr,
