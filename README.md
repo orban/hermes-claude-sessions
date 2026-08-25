@@ -33,7 +33,7 @@ For source development, run from this checkout without changing the active profi
 hermes plugins doctor . --ci
 ```
 
-For production, install the plugin through your normal Hermes plugin installation process. If placing a source checkout directly in the plugin directory, use `$HERMES_HOME/plugins/claude-sessions`; do not copy the bundled skill into `~/.hermes/skills`.
+For production, install the plugin through your normal Hermes plugin installation process. This checkout has no configured distribution remote; do not invent GitHub owner/repository coordinates. If placing a source checkout directly in the plugin directory, use `$HERMES_HOME/plugins/claude-sessions`; do not copy the bundled skill into `~/.hermes/skills`.
 
 ## Model workflow
 

@@ -90,6 +90,8 @@ def test_readme_documents_ownership_handoffs_and_non_goals() -> None:
         "PATH",
         "~/.local/bin/claude",
         "$HERMES_HOME/plugins/claude-sessions",
+        "no configured distribution remote",
+        "do not invent github owner/repository coordinates",
         "hermes plugins doctor . --ci",
         "screen scraping",
         "keystroke injection",
