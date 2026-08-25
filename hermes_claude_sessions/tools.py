@@ -220,11 +220,7 @@ def _claude_session_list() -> str:
             stderr=stderr,
         )
     if len(completed.stdout) > MAX_OUTPUT_CHARS:
-        return _error(
-            "Claude session list is too large to return safely",
-            stdout="",
-            stderr=stderr,
-        )
+        return _error("Claude session list is too large to return safely")
     try:
         sessions = json.loads(completed.stdout)
     except (TypeError, json.JSONDecodeError):
@@ -239,9 +235,5 @@ def _claude_session_list() -> str:
         )
     result = _json({"ok": True, "sessions": sessions})
     if len(result) > MAX_OUTPUT_CHARS:
-        return _error(
-            "Claude session list is too large to return safely",
-            stdout="",
-            stderr=stderr,
-        )
+        return _error("Claude session list is too large to return safely")
     return result

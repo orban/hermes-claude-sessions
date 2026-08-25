@@ -266,7 +266,10 @@ def test_list_rejects_oversized_success_without_truncating_rows(
         tools.subprocess,
         "run",
         lambda *args, **kwargs: subprocess.CompletedProcess(
-            args[0], 0, json.dumps(oversized), ""
+            args[0],
+            0,
+            json.dumps(oversized),
+            "雪" * (tools.MAX_OUTPUT_CHARS + 1),
         ),
     )
 
