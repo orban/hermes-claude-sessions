@@ -1,0 +1,193 @@
+"""Shell-free handlers for native Claude background sessions."""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+from collections.abc import Mapping
+from pathlib import Path
+from typing import Any
+
+ALLOWED_PERMISSION_MODES = ("manual", "acceptEdits", "plan")
+COMMAND_TIMEOUT_SECONDS = 20
+MAX_OUTPUT_CHARS = 8_192
+_TRUNCATION_MARKER = "\n[truncated]"
+_REDACTED_PROMPT = "<redacted>"
+
+
+def _is_executable(path: Path) -> bool:
+    return path.is_file() and os.access(path, os.X_OK)
+
+
+def resolve_claude_bin() -> str | None:
+    """Find an executable Claude CLI with predictable local precedence."""
+    configured = os.environ.get("CLAUDE_BIN")
+    if configured:
+        path = Path(configured).expanduser()
+        if _is_executable(path):
+            return str(path)
+
+    discovered = shutil.which("claude")
+    if discovered:
+        return discovered
+
+    fallback = Path.home() / ".local" / "bin" / "claude"
+    if _is_executable(fallback):
+        return str(fallback)
+    return None
+
+
+def _bounded_output(value: str | None, prompt: str | None = None) -> str:
+    output = value or ""
+    if prompt:
+        output = output.replace(prompt, _REDACTED_PROMPT)
+    if len(output) <= MAX_OUTPUT_CHARS:
+        return output
+    return output[: MAX_OUTPUT_CHARS - len(_TRUNCATION_MARKER)] + _TRUNCATION_MARKER
+
+
+def _json(payload: dict[str, Any]) -> str:
+    return json.dumps(payload)
+
+
+def _error(message: str, **details: Any) -> str:
+    return _json({"ok": False, "error": message, **details})
+
+
+def _parse_start_args(args: object) -> tuple[str, str, Path, str] | str:
+    if not isinstance(args, Mapping):
+        return _error("arguments must be an object")
+
+    name = args.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return _error("name must be a non-empty string")
+
+    prompt = args.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        return _error("prompt must be a non-empty string")
+
+    cwd = args.get("cwd")
+    if not isinstance(cwd, str):
+        return _error("cwd must be an absolute existing directory")
+    path = Path(cwd)
+    if not path.is_absolute() or not path.is_dir():
+        return _error("cwd must be an absolute existing directory")
+
+    mode = args.get("permission_mode", "manual")
+    if mode not in ALLOWED_PERMISSION_MODES:
+        return _error("permission_mode must be one of: manual, acceptEdits, plan")
+    return name, prompt, path, mode
+
+
+def claude_session_start(args: object, **kwargs: object) -> str:
+    """Start one native Claude background session without exposing its prompt."""
+    del kwargs
+    parsed = _parse_start_args(args)
+    if isinstance(parsed, str):
+        return parsed
+    name, prompt, cwd, mode = parsed
+    details = {"name": name, "cwd": str(cwd), "mode": mode}
+
+    claude_bin = resolve_claude_bin()
+    if claude_bin is None:
+        return _error(
+            "Claude CLI is unavailable; set CLAUDE_BIN or install an executable "
+            "claude binary",
+            **details,
+            stdout="",
+            stderr="",
+        )
+
+    argv = [
+        claude_bin,
+        "--bg",
+        "--name",
+        name,
+        "--permission-mode",
+        mode,
+        prompt,
+    ]
+    try:
+        completed = subprocess.run(
+            argv,
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=COMMAND_TIMEOUT_SECONDS,
+            shell=False,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return _error(
+            "Claude command timed out after 20 seconds",
+            **details,
+            stdout="",
+            stderr="",
+        )
+    except OSError:
+        return _error(
+            "Claude command could not be started", **details, stdout="", stderr=""
+        )
+
+    payload = {
+        "ok": completed.returncode == 0,
+        "returncode": completed.returncode,
+        **details,
+        "stdout": _bounded_output(completed.stdout, prompt),
+        "stderr": _bounded_output(completed.stderr, prompt),
+    }
+    if completed.returncode != 0:
+        payload["error"] = "Claude command exited with a non-zero status"
+    return _json(payload)
+
+
+def claude_session_list(args: object, **kwargs: object) -> str:
+    """Return the native Claude CLI's unmodified session rows."""
+    del args, kwargs
+    claude_bin = resolve_claude_bin()
+    if claude_bin is None:
+        return _error(
+            "Claude CLI is unavailable; set CLAUDE_BIN or install an executable "
+            "claude binary",
+            stdout="",
+            stderr="",
+        )
+
+    try:
+        completed = subprocess.run(
+            [claude_bin, "agents", "--json", "--all"],
+            capture_output=True,
+            text=True,
+            timeout=COMMAND_TIMEOUT_SECONDS,
+            shell=False,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return _error("Claude command timed out after 20 seconds", stdout="", stderr="")
+    except OSError:
+        return _error("Claude command could not be started", stdout="", stderr="")
+
+    stdout = _bounded_output(completed.stdout)
+    stderr = _bounded_output(completed.stderr)
+    if completed.returncode != 0:
+        return _error(
+            "Claude command exited with a non-zero status",
+            returncode=completed.returncode,
+            stdout=stdout,
+            stderr=stderr,
+        )
+    try:
+        sessions = json.loads(completed.stdout)
+    except (TypeError, json.JSONDecodeError):
+        return _error(
+            "Claude session list returned malformed JSON", stdout=stdout, stderr=stderr
+        )
+    if not isinstance(sessions, list):
+        return _error(
+            "Claude session list must be a top-level JSON list",
+            stdout=stdout,
+            stderr=stderr,
+        )
+    return _json({"ok": True, "sessions": sessions})

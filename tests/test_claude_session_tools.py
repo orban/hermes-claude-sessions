@@ -1,0 +1,388 @@
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+ROOT = Path(__file__).parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from hermes_claude_sessions import hooks, plugin, schemas, tools  # noqa: E402
+
+
+class RecordingContext:
+    def __init__(self) -> None:
+        self.tools: list[dict[str, Any]] = []
+        self.hooks: list[tuple[str, object]] = []
+
+    def register_tool(self, **kwargs: object) -> None:
+        self.tools.append(dict(kwargs))
+
+    def register_hook(self, name: str, callback: object) -> None:
+        self.hooks.append((name, callback))
+
+
+def decode(result: str) -> dict[str, Any]:
+    return json.loads(result)
+
+
+def test_schemas_describe_only_native_background_sessions() -> None:
+    start = schemas.CLAUDE_SESSION_START
+    listing = schemas.CLAUDE_SESSION_LIST
+
+    assert start["name"] == "claude_session_start"
+    assert set(start["parameters"]["required"]) == {"name", "cwd", "prompt"}
+    assert start["parameters"]["properties"]["permission_mode"] == {
+        "type": "string",
+        "enum": ["manual", "acceptEdits", "plan"],
+        "default": "manual",
+    }
+    assert "native Claude background sessions" in start["description"]
+    assert listing["name"] == "claude_session_list"
+    assert listing["parameters"] == {"type": "object", "properties": {}}
+    assert "read-only" in listing["description"].lower()
+
+
+def test_start_uses_exact_shell_free_argv_and_default_mode(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: list[dict[str, Any]] = []
+
+    def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append({"args": args, "kwargs": kwargs})
+        return subprocess.CompletedProcess(args[0], 0, "started", "")
+
+    monkeypatch.setattr(tools, "resolve_claude_bin", lambda: "/mock/claude")
+    monkeypatch.setattr(tools.subprocess, "run", fake_run)
+
+    result = decode(
+        tools.claude_session_start(
+            {"name": "review", "cwd": str(tmp_path), "prompt": "secret prompt"}
+        )
+    )
+
+    assert result == {
+        "ok": True,
+        "returncode": 0,
+        "name": "review",
+        "cwd": str(tmp_path),
+        "mode": "manual",
+        "stdout": "started",
+        "stderr": "",
+    }
+    assert calls == [
+        {
+            "args": (
+                [
+                    "/mock/claude",
+                    "--bg",
+                    "--name",
+                    "review",
+                    "--permission-mode",
+                    "manual",
+                    "secret prompt",
+                ],
+            ),
+            "kwargs": {
+                "cwd": str(tmp_path),
+                "capture_output": True,
+                "text": True,
+                "timeout": 20,
+                "shell": False,
+                "check": False,
+            },
+        }
+    ]
+
+
+@pytest.mark.parametrize("mode", ["manual", "acceptEdits", "plan"])
+def test_start_accepts_each_allowed_mode(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, mode: str
+) -> None:
+    captured: list[str] = []
+
+    def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        del kwargs
+        captured.extend(argv)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(tools, "resolve_claude_bin", lambda: "/mock/claude")
+    monkeypatch.setattr(tools.subprocess, "run", fake_run)
+
+    assert (
+        decode(
+            tools.claude_session_start(
+                {
+                    "name": "job",
+                    "cwd": str(tmp_path),
+                    "prompt": "work",
+                    "permission_mode": mode,
+                }
+            )
+        )["ok"]
+        is True
+    )
+    assert captured[-3:] == ["--permission-mode", mode, "work"]
+
+
+@pytest.mark.parametrize(
+    "args,error",
+    [
+        ({"name": "", "cwd": "/", "prompt": "work"}, "name must be a non-empty string"),
+        (
+            {"name": "job", "cwd": "/", "prompt": ""},
+            "prompt must be a non-empty string",
+        ),
+        (
+            {"name": "job", "cwd": "relative", "prompt": "work"},
+            "cwd must be an absolute existing directory",
+        ),
+        (
+            {"name": "job", "cwd": "/definitely/missing", "prompt": "work"},
+            "cwd must be an absolute existing directory",
+        ),
+        (
+            {"name": "job", "cwd": "/", "prompt": "work", "permission_mode": "yolo"},
+            "permission_mode must be one of: manual, acceptEdits, plan",
+        ),
+    ],
+)
+def test_start_validation_errors_are_json(
+    monkeypatch: pytest.MonkeyPatch, args: dict[str, str], error: str
+) -> None:
+    monkeypatch.setattr(
+        tools, "resolve_claude_bin", lambda: pytest.fail("should not resolve")
+    )
+
+    result = decode(tools.claude_session_start(args))
+
+    assert result == {"ok": False, "error": error}
+
+
+def test_start_never_returns_prompt_even_when_cli_echoes_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    prompt = "super secret task text"
+    monkeypatch.setattr(tools, "resolve_claude_bin", lambda: "/mock/claude")
+    monkeypatch.setattr(
+        tools.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, prompt, prompt),
+    )
+
+    result = tools.claude_session_start(
+        {"name": "job", "cwd": str(tmp_path), "prompt": prompt}
+    )
+
+    assert prompt not in result
+    assert decode(result)["stdout"] == "<redacted>"
+    assert decode(result)["stderr"] == "<redacted>"
+
+
+def test_resolver_precedence(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    override = tmp_path / "override-claude"
+    fallback = tmp_path / "fallback-claude"
+    override.touch()
+    fallback.touch()
+    override.chmod(0o755)
+    fallback.chmod(0o755)
+    monkeypatch.setenv("CLAUDE_BIN", str(override))
+    monkeypatch.setattr(tools.shutil, "which", lambda _: str(fallback))
+
+    assert tools.resolve_claude_bin() == str(override)
+
+    monkeypatch.delenv("CLAUDE_BIN")
+    assert tools.resolve_claude_bin() == str(fallback)
+
+    monkeypatch.setattr(tools.shutil, "which", lambda _: None)
+    local_binary = tmp_path / ".local" / "bin" / "claude"
+    local_binary.parent.mkdir(parents=True)
+    local_binary.touch()
+    local_binary.chmod(0o755)
+    monkeypatch.setattr(tools.Path, "home", classmethod(lambda cls: tmp_path))
+    assert tools.resolve_claude_bin() == str(local_binary)
+
+
+def test_start_bounds_captured_output(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(tools, "resolve_claude_bin", lambda: "/mock/claude")
+    monkeypatch.setattr(
+        tools.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0], 0, "o" * 20_000, "e" * 20_000
+        ),
+    )
+
+    result = decode(
+        tools.claude_session_start(
+            {"name": "job", "cwd": str(tmp_path), "prompt": "work"}
+        )
+    )
+
+    assert len(result["stdout"]) <= tools.MAX_OUTPUT_CHARS
+    assert len(result["stderr"]) <= tools.MAX_OUTPUT_CHARS
+    assert result["stdout"].endswith("[truncated]")
+    assert result["stderr"].endswith("[truncated]")
+
+
+def test_list_returns_native_rows_unchanged_and_shell_free(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rows = [{"id": "native", "nested": {"state": "idle"}}, {"new": [1, 2]}]
+    calls: list[dict[str, Any]] = []
+
+    def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append({"args": args, "kwargs": kwargs})
+        return subprocess.CompletedProcess(args[0], 0, json.dumps(rows), "")
+
+    monkeypatch.setattr(tools, "resolve_claude_bin", lambda: "/mock/claude")
+    monkeypatch.setattr(tools.subprocess, "run", fake_run)
+
+    assert decode(tools.claude_session_list({})) == {"ok": True, "sessions": rows}
+    assert calls[0]["args"] == (["/mock/claude", "agents", "--json", "--all"],)
+    assert calls[0]["kwargs"] == {
+        "capture_output": True,
+        "text": True,
+        "timeout": 20,
+        "shell": False,
+        "check": False,
+    }
+
+
+@pytest.mark.parametrize("failure", ["unavailable", "timeout", "nonzero", "malformed"])
+def test_list_errors_are_controlled_json(
+    monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    if failure == "unavailable":
+        monkeypatch.setattr(tools, "resolve_claude_bin", lambda: None)
+    elif failure == "timeout":
+        monkeypatch.setattr(tools, "resolve_claude_bin", lambda: "/mock/claude")
+        monkeypatch.setattr(
+            tools.subprocess,
+            "run",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                subprocess.TimeoutExpired(args[0], 20, output="secret", stderr="secret")
+            ),
+        )
+    elif failure == "nonzero":
+        monkeypatch.setattr(tools, "resolve_claude_bin", lambda: "/mock/claude")
+        monkeypatch.setattr(
+            tools.subprocess,
+            "run",
+            lambda *args, **kwargs: subprocess.CompletedProcess(
+                args[0], 3, "out", "err"
+            ),
+        )
+    else:
+        monkeypatch.setattr(tools, "resolve_claude_bin", lambda: "/mock/claude")
+        monkeypatch.setattr(
+            tools.subprocess,
+            "run",
+            lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, "{}", ""),
+        )
+
+    result = decode(tools.claude_session_list({}))
+
+    assert result["ok"] is False
+    assert "error" in result
+    assert "secret" not in json.dumps(result)
+
+
+def test_start_timeout_and_nonzero_are_controlled_json(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(tools, "resolve_claude_bin", lambda: "/mock/claude")
+    monkeypatch.setattr(
+        tools.subprocess,
+        "run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            subprocess.TimeoutExpired(args[0], 20)
+        ),
+    )
+    timeout = decode(
+        tools.claude_session_start(
+            {"name": "job", "cwd": str(tmp_path), "prompt": "secret"}
+        )
+    )
+    assert timeout == {
+        "ok": False,
+        "error": "Claude command timed out after 20 seconds",
+        "name": "job",
+        "cwd": str(tmp_path),
+        "mode": "manual",
+        "stdout": "",
+        "stderr": "",
+    }
+
+    monkeypatch.setattr(
+        tools.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 2, "out", "err"),
+    )
+    nonzero = decode(
+        tools.claude_session_start(
+            {"name": "job", "cwd": str(tmp_path), "prompt": "secret"}
+        )
+    )
+    assert nonzero["ok"] is False
+    assert nonzero["returncode"] == 2
+    assert nonzero["stdout"] == "out"
+    assert nonzero["stderr"] == "err"
+
+
+def test_approval_hook_only_requests_start_without_prompt() -> None:
+    prompt = "do not expose this"
+    approval = hooks.pre_tool_call(
+        "claude_session_start",
+        {
+            "name": "job",
+            "cwd": "/tmp/work",
+            "prompt": prompt,
+            "permission_mode": "plan",
+        },
+        task_id="ignored",
+    )
+
+    assert approval is not None
+    assert approval["action"] == "approve"
+    assert prompt not in approval["message"]
+    assert "job" in approval["message"]
+    assert "/tmp/work" in approval["message"]
+    assert "plan" in approval["message"]
+    assert hooks.pre_tool_call("claude_session_list", {}, task_id="ignored") is None
+    assert hooks.pre_tool_call("other", {"prompt": prompt}, task_id="ignored") is None
+
+
+def test_registers_exactly_two_tools_and_one_pre_tool_hook() -> None:
+    context = RecordingContext()
+
+    plugin.register(context)
+
+    assert [item["name"] for item in context.tools] == [
+        "claude_session_start",
+        "claude_session_list",
+    ]
+    assert {item["toolset"] for item in context.tools} == {"claude_sessions"}
+    assert [item["schema"] for item in context.tools] == [
+        schemas.CLAUDE_SESSION_START,
+        schemas.CLAUDE_SESSION_LIST,
+    ]
+    assert context.hooks == [("pre_tool_call", hooks.pre_tool_call)]
+
+
+def test_manifest_declares_exact_tools_and_hook() -> None:
+    manifest = (Path(__file__).parents[1] / "plugin.yaml").read_text()
+
+    assert (
+        "provides_tools:\n  - claude_session_start\n  - claude_session_list" in manifest
+    )
+    assert "provides_hooks:\n  - pre_tool_call" in manifest
+    assert manifest.count("  - claude_session_") == 2
+    assert manifest.count("  - pre_tool_call") == 1
