@@ -84,6 +84,13 @@ def _parse_start_args(args: object) -> tuple[str, str, Path, str] | str:
 def claude_session_start(args: object, **kwargs: object) -> str:
     """Start one native Claude background session without exposing its prompt."""
     del kwargs
+    try:
+        return _claude_session_start(args)
+    except Exception:
+        return _error("Claude session start failed unexpectedly")
+
+
+def _claude_session_start(args: object) -> str:
     parsed = _parse_start_args(args)
     if isinstance(parsed, str):
         return parsed
@@ -107,6 +114,7 @@ def claude_session_start(args: object, **kwargs: object) -> str:
         name,
         "--permission-mode",
         mode,
+        "--",
         prompt,
     ]
     try:
@@ -146,6 +154,13 @@ def claude_session_start(args: object, **kwargs: object) -> str:
 def claude_session_list(args: object, **kwargs: object) -> str:
     """Return the native Claude CLI's unmodified session rows."""
     del args, kwargs
+    try:
+        return _claude_session_list()
+    except Exception:
+        return _error("Claude session list failed unexpectedly")
+
+
+def _claude_session_list() -> str:
     claude_bin = resolve_claude_bin()
     if claude_bin is None:
         return _error(

@@ -85,6 +85,7 @@ def test_start_uses_exact_shell_free_argv_and_default_mode(
                     "review",
                     "--permission-mode",
                     "manual",
+                    "--",
                     "secret prompt",
                 ],
             ),
@@ -127,7 +128,7 @@ def test_start_accepts_each_allowed_mode(
         )["ok"]
         is True
     )
-    assert captured[-3:] == ["--permission-mode", mode, "work"]
+    assert captured[-4:] == ["--permission-mode", mode, "--", "work"]
 
 
 @pytest.mark.parametrize(
@@ -335,6 +336,53 @@ def test_start_timeout_and_nonzero_are_controlled_json(
     assert nonzero["returncode"] == 2
     assert nonzero["stdout"] == "out"
     assert nonzero["stderr"] == "err"
+
+
+def test_start_uses_end_of_options_before_prompt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    captured: list[str] = []
+
+    def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        del kwargs
+        captured.extend(argv)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(tools, "resolve_claude_bin", lambda: "/mock/claude")
+    monkeypatch.setattr(tools.subprocess, "run", fake_run)
+
+    result = decode(
+        tools.claude_session_start(
+            {
+                "name": "job",
+                "cwd": str(tmp_path),
+                "prompt": "--dangerously-skip-permissions",
+            }
+        )
+    )
+
+    assert result["ok"] is True
+    assert captured[-2:] == ["--", "--dangerously-skip-permissions"]
+
+
+def test_handlers_never_raise_unexpected_internal_errors(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def fail_resolution() -> str:
+        raise RuntimeError("sensitive internal detail")
+
+    monkeypatch.setattr(tools, "resolve_claude_bin", fail_resolution)
+
+    start = decode(
+        tools.claude_session_start(
+            {"name": "job", "cwd": str(tmp_path), "prompt": "secret prompt"}
+        )
+    )
+    listing = decode(tools.claude_session_list({}))
+
+    assert start["ok"] is False
+    assert listing["ok"] is False
+    assert "sensitive internal detail" not in json.dumps([start, listing])
 
 
 def test_approval_hook_only_requests_start_without_prompt() -> None:
