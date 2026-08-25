@@ -18,6 +18,7 @@ from hermes_claude_sessions.characterization import (
     _discover_worktree_identity,
     _mint_worktree_probe,
     _observe_worktree_probe,
+    _worktree_cleanup,
     _worktree_launch_argv,
     _worktree_paths,
     _WorktreeProbe,
@@ -313,6 +314,48 @@ def test_observation_polls_until_exact_native_session_is_terminal(
     assert calls == 2
     assert result["native_terminal_observed"] is True
     assert result["probe_status"] == "not_observed"
+
+
+def test_cleanup_accepts_done_after_successful_stop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    full = str(uuid.uuid4())
+    probe = _WorktreeProbe("worktree-done-cleanup", full, full[:8])
+    calls: list[tuple[str, ...]] = []
+
+    def runner(*args) -> CommandCapture:
+        argv = args[2]
+        calls.append(argv)
+        if argv[1] == "stop":
+            return CommandCapture(argv, 0, "stopped\n", "", False, None)
+        if argv[1:3] == ("agents", "--json"):
+            return CommandCapture(
+                argv,
+                0,
+                json.dumps(
+                    [
+                        {
+                            "id": full[:8],
+                            "sessionId": full,
+                            "name": probe.display_name,
+                            "state": "done",
+                        }
+                    ]
+                ),
+                "",
+                False,
+                None,
+            )
+        raise AssertionError(argv)
+
+    monkeypatch.setattr(
+        "hermes_claude_sessions.characterization._run_owned_worktree_command", runner
+    )
+
+    assert _worktree_cleanup(
+        Path(EXACT_CLAUDE_BIN), probe, tmp_path, time.monotonic() + 1
+    )
+    assert [call[1] for call in calls] == ["stop", "agents"]
 
 
 def test_identity_finally_cleanup_sanitization_and_unrelated_preservation(

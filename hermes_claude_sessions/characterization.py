@@ -1526,11 +1526,7 @@ def _worktree_cleanup(
                 return False
             if len(matches) == 0:
                 return True
-            if len(matches) == 1 and matches[0].get("state") in {
-                "completed",
-                "failed",
-                "stopped",
-            }:
+            if len(matches) == 1 and matches[0].get("state") in _TERMINAL_STATES:
                 return True
             if len(matches) > 1:
                 return False
