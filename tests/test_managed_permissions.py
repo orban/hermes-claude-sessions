@@ -476,8 +476,8 @@ def test_owned_logs_return_bounded_recent_output(
         lambda argv: subprocess.CompletedProcess(
             argv,
             0,
-            "old" + "x" * tools.MAX_OUTPUT_CHARS + "recent-stdout",
-            "old" + "y" * tools.MAX_OUTPUT_CHARS + "recent-stderr",
+            "old" + "\x00" * tools.MAX_OUTPUT_CHARS + "recent-stdout",
+            "old" + "\x01" * tools.MAX_OUTPUT_CHARS + "recent-stderr",
         ),
     )
 

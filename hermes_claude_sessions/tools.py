@@ -80,6 +80,25 @@ def _bounded_json(payload: dict[str, Any], message: str) -> str:
     return _error(message, output_omitted=True)
 
 
+def _bounded_log_json(payload: dict[str, Any]) -> str:
+    """Fit recent log tails to the serialized tool-result byte budget."""
+    while True:
+        result = _json(payload)
+        if len(result.encode("utf-8")) <= MAX_OUTPUT_CHARS:
+            return result
+        shrunk = False
+        for field in ("stdout", "stderr"):
+            value = payload.get(field)
+            if isinstance(value, str) and len(value) > 256:
+                payload[field] = _bounded_tail(value, max(256, len(value) // 2))
+                shrunk = True
+        if not shrunk:
+            return _error(
+                "Claude session logs are too large to return safely",
+                output_omitted=True,
+            )
+
+
 def _redact_prompt_value(value: Any, prompt: str) -> Any:
     if isinstance(value, str):
         return without_prompt(value, prompt)
@@ -404,7 +423,7 @@ def claude_session_logs(args: object, **kwargs: object) -> str:
     }
     if completed.returncode != 0:
         payload["error"] = "Claude command exited with a non-zero status"
-    return _bounded_json(payload, "Claude session logs are too large to return safely")
+    return _bounded_log_json(payload)
 
 
 def claude_session_stop(args: object, **kwargs: object) -> str:
