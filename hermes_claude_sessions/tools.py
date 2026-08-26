@@ -445,7 +445,7 @@ def claude_session_stop(args: object, **kwargs: object) -> str:
             stderr=_bounded_output(completed.stderr),
         )
 
-    terminal_states = {"completed", "failed", "stopped", "terminated"}
+    terminal_states = {"completed", "done", "failed", "stopped", "terminated"}
     for _ in range(10):
         sessions = _native_sessions(claude_bin)
         if isinstance(sessions, str):
