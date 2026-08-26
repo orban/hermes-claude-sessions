@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import threading
 from io import StringIO
@@ -128,6 +129,55 @@ def test_permission_hook_round_trip_allows_once(
         }
     }
     assert bridge.list_pending() == []
+
+
+def test_executable_permission_hook_round_trip(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    session = prepare_session(monkeypatch, tmp_path)
+    executable = tools._CLAUDE_PLUGIN_DIR / "hooks" / "permission_bridge.py"
+    environment = os.environ.copy()
+    environment.update(
+        {
+            bridge.SESSION_DIR_ENV: str(session),
+            bridge.TIMEOUT_ENV: "2",
+        }
+    )
+    process = subprocess.Popen(
+        [str(executable)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=environment,
+    )
+    assert process.stdin is not None
+    process.stdin.write(
+        json.dumps(
+            {
+                "hook_event_name": "PermissionRequest",
+                "tool_name": "Bash",
+                "tool_input": {"command": "git diff --check"},
+            }
+        )
+    )
+    process.stdin.close()
+
+    pending = bridge.wait_for_pending(timeout_seconds=1)
+    assert pending is not None
+    assert bridge.decide(
+        pending["request_id"],
+        "allow",
+        "bounded repository verification",
+    )["ok"]
+    assert process.stdout is not None
+    assert process.stderr is not None
+    stdout = process.stdout.read()
+    stderr = process.stderr.read()
+    assert process.wait(timeout=2) == 0
+
+    assert stderr == ""
+    assert json.loads(stdout)["hookSpecificOutput"]["decision"] == {"behavior": "allow"}
 
 
 def test_permission_hook_denies_on_timeout(
