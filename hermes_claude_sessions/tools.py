@@ -19,7 +19,10 @@ ALLOWED_PERMISSION_MODES = ("auto", "manual", "acceptEdits", "plan")
 DEFAULT_PERMISSION_MODE = "auto"
 COMMAND_TIMEOUT_SECONDS = 20
 MAX_OUTPUT_CHARS = 8_192
+LOG_STDOUT_CHARS = 5_500
+LOG_STDERR_CHARS = 1_000
 _TRUNCATION_MARKER = "\n[truncated]"
+_LEADING_TRUNCATION_MARKER = "[truncated]\n"
 _LAUNCH_ID = re.compile(r"backgrounded\s+·\s+([0-9a-f]{8})\s+·")
 _NATIVE_ID = re.compile(r"^[0-9a-f]{8}$")
 _CLAUDE_PLUGIN_DIR = Path(__file__).resolve().parent / "claude_plugin"
@@ -54,6 +57,16 @@ def _bounded_output(value: str | None, prompt: str | None = None) -> str:
     if len(output) <= MAX_OUTPUT_CHARS:
         return output
     return output[: MAX_OUTPUT_CHARS - len(_TRUNCATION_MARKER)] + _TRUNCATION_MARKER
+
+
+def _bounded_tail(value: str | None, limit: int) -> str:
+    output = value or ""
+    if len(output) <= limit:
+        return output
+    return (
+        _LEADING_TRUNCATION_MARKER
+        + output[-(limit - len(_LEADING_TRUNCATION_MARKER)) :]
+    )
 
 
 def _json(payload: dict[str, Any]) -> str:
@@ -386,8 +399,8 @@ def claude_session_logs(args: object, **kwargs: object) -> str:
         "ok": completed.returncode == 0,
         "id": native_id,
         "returncode": completed.returncode,
-        "stdout": _bounded_output(completed.stdout),
-        "stderr": _bounded_output(completed.stderr),
+        "stdout": _bounded_tail(completed.stdout, LOG_STDOUT_CHARS),
+        "stderr": _bounded_tail(completed.stderr, LOG_STDERR_CHARS),
     }
     if completed.returncode != 0:
         payload["error"] = "Claude command exited with a non-zero status"

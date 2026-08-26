@@ -465,6 +465,32 @@ def test_owned_logs_and_stop_surface_native_failures(
     assert not decode(tools.claude_session_stop({"id": "a1b2c3d4"}))["ok"]
 
 
+def test_owned_logs_return_bounded_recent_output(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    prepare_session(monkeypatch, tmp_path)
+    monkeypatch.setattr(tools, "resolve_claude_bin", lambda: "/mock/claude")
+    monkeypatch.setattr(
+        tools,
+        "_run_claude",
+        lambda argv: subprocess.CompletedProcess(
+            argv,
+            0,
+            "old" + "x" * tools.MAX_OUTPUT_CHARS + "recent-stdout",
+            "old" + "y" * tools.MAX_OUTPUT_CHARS + "recent-stderr",
+        ),
+    )
+
+    result_text = tools.claude_session_logs({"id": "a1b2c3d4"})
+    result = decode(result_text)
+
+    assert result["ok"] is True
+    assert result["stdout"].startswith("[truncated]\n")
+    assert result["stdout"].endswith("recent-stdout")
+    assert result["stderr"].endswith("recent-stderr")
+    assert len(result_text) <= tools.MAX_OUTPUT_CHARS
+
+
 def test_stop_requires_readback_confirmation(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
