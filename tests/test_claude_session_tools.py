@@ -13,7 +13,14 @@ ROOT = Path(__file__).parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from hermes_claude_sessions import cli, hooks, plugin, schemas, tools  # noqa: E402
+from hermes_claude_sessions import (  # noqa: E402
+    bridge,
+    cli,
+    hooks,
+    plugin,
+    schemas,
+    tools,
+)
 
 
 class RecordingContext:
@@ -48,10 +55,10 @@ def test_schemas_describe_only_native_background_sessions() -> None:
     assert set(start["parameters"]["required"]) == {"name", "cwd", "prompt"}
     assert start["parameters"]["properties"]["permission_mode"] == {
         "type": "string",
-        "enum": ["manual", "acceptEdits", "plan"],
-        "default": "manual",
+        "enum": ["auto", "manual", "acceptEdits", "plan"],
+        "default": "auto",
     }
-    assert "native Claude background sessions" in start["description"]
+    assert "native Claude background session" in start["description"]
     assert listing["name"] == "claude_session_list"
     assert listing["parameters"] == {"type": "object", "properties": {}}
     assert "read-only" in listing["description"].lower()
@@ -64,9 +71,12 @@ def test_start_uses_exact_shell_free_argv_and_default_mode(
 
     def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
         calls.append({"args": args, "kwargs": kwargs})
-        return subprocess.CompletedProcess(args[0], 0, "started", "")
+        return subprocess.CompletedProcess(
+            args[0], 0, "backgrounded · a1b2c3d4 · review", ""
+        )
 
     monkeypatch.setattr(tools, "resolve_claude_bin", lambda: "/mock/claude")
+    monkeypatch.setattr(bridge, "state_root", lambda: tmp_path / "state")
     monkeypatch.setattr(tools.subprocess, "run", fake_run)
 
     result = decode(
@@ -80,37 +90,40 @@ def test_start_uses_exact_shell_free_argv_and_default_mode(
         "returncode": 0,
         "name": "review",
         "cwd": str(tmp_path),
-        "mode": "manual",
-        "stdout": "started",
+        "mode": "auto",
+        "stdout": "backgrounded · a1b2c3d4 · review",
         "stderr": "",
+        "id": "a1b2c3d4",
+        "managed_permissions": True,
     }
-    assert calls == [
-        {
-            "args": (
-                [
-                    "/mock/claude",
-                    "--bg",
-                    "--name",
-                    "review",
-                    "--permission-mode",
-                    "manual",
-                    "--",
-                    "secret prompt",
-                ],
-            ),
-            "kwargs": {
-                "cwd": str(tmp_path),
-                "capture_output": True,
-                "text": True,
-                "timeout": 20,
-                "shell": False,
-                "check": False,
-            },
-        }
+    argv = calls[0]["args"][0]
+    assert argv == [
+        "/mock/claude",
+        "--bg",
+        "--name",
+        "review",
+        "--permission-mode",
+        "auto",
+        "--plugin-dir",
+        str(tools._CLAUDE_PLUGIN_DIR),
+        "--",
+        "secret prompt",
     ]
+    kwargs = dict(calls[0]["kwargs"])
+    environment = kwargs.pop("env")
+    assert isinstance(environment, dict)
+    assert Path(environment[bridge.SESSION_DIR_ENV]).parent == tmp_path / "state"
+    assert kwargs == {
+        "cwd": str(tmp_path),
+        "capture_output": True,
+        "text": True,
+        "timeout": 20,
+        "shell": False,
+        "check": False,
+    }
 
 
-@pytest.mark.parametrize("mode", ["manual", "acceptEdits", "plan"])
+@pytest.mark.parametrize("mode", ["auto", "manual", "acceptEdits", "plan"])
 def test_start_accepts_each_allowed_mode(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, mode: str
 ) -> None:
@@ -119,9 +132,10 @@ def test_start_accepts_each_allowed_mode(
     def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         del kwargs
         captured.extend(argv)
-        return subprocess.CompletedProcess(argv, 0, "", "")
+        return subprocess.CompletedProcess(argv, 0, "backgrounded · a1b2c3d4 · job", "")
 
     monkeypatch.setattr(tools, "resolve_claude_bin", lambda: "/mock/claude")
+    monkeypatch.setattr(bridge, "state_root", lambda: tmp_path / "state")
     monkeypatch.setattr(tools.subprocess, "run", fake_run)
 
     assert (
@@ -137,7 +151,9 @@ def test_start_accepts_each_allowed_mode(
         )["ok"]
         is True
     )
-    assert captured[-4:] == ["--permission-mode", mode, "--", "work"]
+    assert captured[captured.index("--permission-mode") + 1] == mode
+    assert captured[-2:] == ["--", "work"]
+    assert ("--plugin-dir" in captured) is (mode == "auto")
 
 
 @pytest.mark.parametrize(
@@ -163,7 +179,7 @@ def test_start_accepts_each_allowed_mode(
         ),
         (
             {"name": "job", "cwd": "/", "prompt": "work", "permission_mode": "yolo"},
-            "permission_mode must be one of: manual, acceptEdits, plan",
+            "permission_mode must be one of: auto, manual, acceptEdits, plan",
         ),
     ],
 )
@@ -203,7 +219,12 @@ def test_prompt_redaction_sentinel_cannot_alias_prompt(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     prompt = "<redacted>"
-    args = {"name": prompt, "cwd": str(tmp_path), "prompt": prompt}
+    args = {
+        "name": prompt,
+        "cwd": str(tmp_path),
+        "prompt": prompt,
+        "permission_mode": "manual",
+    }
     monkeypatch.setattr(tools, "resolve_claude_bin", lambda: "/mock/claude")
     monkeypatch.setattr(
         tools.subprocess,
@@ -357,7 +378,12 @@ def test_start_bounds_captured_output(
     )
 
     result_text = tools.claude_session_start(
-        {"name": "job", "cwd": str(tmp_path), "prompt": "work"}
+        {
+            "name": "job",
+            "cwd": str(tmp_path),
+            "prompt": "work",
+            "permission_mode": "manual",
+        }
     )
     result = decode(result_text)
 
@@ -569,6 +595,7 @@ def test_start_timeout_and_nonzero_are_controlled_json(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setattr(tools, "resolve_claude_bin", lambda: "/mock/claude")
+    monkeypatch.setattr(bridge, "state_root", lambda: tmp_path / "state")
     monkeypatch.setattr(
         tools.subprocess,
         "run",
@@ -586,7 +613,7 @@ def test_start_timeout_and_nonzero_are_controlled_json(
         "error": "Claude command timed out after 20 seconds",
         "name": "job",
         "cwd": str(tmp_path),
-        "mode": "manual",
+        "mode": "auto",
         "stdout": "",
         "stderr": "",
     }
@@ -626,6 +653,7 @@ def test_start_uses_end_of_options_before_prompt(
                 "name": "job",
                 "cwd": str(tmp_path),
                 "prompt": "--dangerously-skip-permissions",
+                "permission_mode": "manual",
             }
         )
     )
@@ -778,7 +806,7 @@ def test_prompt_redaction_preserves_json_structure(
     assert result["ok"] is True
 
 
-def test_registers_exactly_two_tools_and_one_pre_tool_hook() -> None:
+def test_registers_managed_tools_and_one_pre_tool_hook() -> None:
     context = RecordingContext()
 
     plugin.register(context)
@@ -786,11 +814,19 @@ def test_registers_exactly_two_tools_and_one_pre_tool_hook() -> None:
     assert [item["name"] for item in context.tools] == [
         "claude_session_start",
         "claude_session_list",
+        "claude_permission_list",
+        "claude_permission_decide",
+        "claude_session_logs",
+        "claude_session_stop",
     ]
     assert {item["toolset"] for item in context.tools} == {"claude_sessions"}
     assert [item["schema"] for item in context.tools] == [
         schemas.CLAUDE_SESSION_START,
         schemas.CLAUDE_SESSION_LIST,
+        schemas.CLAUDE_PERMISSION_LIST,
+        schemas.CLAUDE_PERMISSION_DECIDE,
+        schemas.CLAUDE_SESSION_LOGS,
+        schemas.CLAUDE_SESSION_STOP,
     ]
     assert context.hooks == [("pre_tool_call", hooks.pre_tool_call)]
     assert context.cli_commands == [
@@ -803,12 +839,18 @@ def test_registers_exactly_two_tools_and_one_pre_tool_hook() -> None:
     ]
 
 
-def test_manifest_declares_exact_tools_and_hook() -> None:
+def test_manifest_declares_managed_tools_and_hook() -> None:
     manifest = (Path(__file__).parents[1] / "plugin.yaml").read_text()
 
-    assert (
-        "provides_tools:\n  - claude_session_start\n  - claude_session_list" in manifest
-    )
+    for tool_name in (
+        "claude_session_start",
+        "claude_session_list",
+        "claude_permission_list",
+        "claude_permission_decide",
+        "claude_session_logs",
+        "claude_session_stop",
+    ):
+        assert f"  - {tool_name}\n" in manifest
     assert "provides_hooks:\n  - pre_tool_call" in manifest
-    assert manifest.count("  - claude_session_") == 2
+    assert manifest.count("  - claude_") == 6
     assert manifest.count("  - pre_tool_call") == 1

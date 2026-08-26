@@ -67,12 +67,17 @@ def test_operating_skill_has_valid_frontmatter_and_safety_boundaries() -> None:
     for required in (
         "claude_session_start",
         "claude_session_list",
+        "claude_permission_list",
+        "claude_permission_decide",
+        "claude_session_logs",
+        "claude_session_stop",
+        "default `auto` classifier",
         "hermes claude agents",
         "hermes claude attach <id>",
-        "Never bypass permissions",
-        "Never infer state from terminal text",
-        "do not retry paid launches automatically",
-        "zmx",
+        "never request `bypassPermissions`",
+        "independently inspect",
+        "deny closed",
+        "Do not retry a failed paid launch automatically",
     ):
         assert required.lower() in text.lower()
 
@@ -83,6 +88,11 @@ def test_readme_documents_ownership_handoffs_and_non_goals() -> None:
     for required in (
         "claude_session_start",
         "claude_session_list",
+        "claude_permission_list",
+        "claude_permission_decide",
+        "claude_session_logs",
+        "claude_session_stop",
+        "--permission-mode auto",
         "hermes claude agents",
         "hermes claude attach <id>",
         "claude-sessions:native-claude-sessions",
@@ -96,8 +106,8 @@ def test_readme_documents_ownership_handoffs_and_non_goals() -> None:
         "screen scraping",
         "keystroke injection",
         "bypassPermissions",
-        "persistence/reconciliation/stop/respawn/cleanup",
-        "zmx fallback only",
+        "governance boundary, not an OS sandbox",
+        "fail-closed",
         "opt-in",
         "cost",
     ):

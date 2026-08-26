@@ -162,7 +162,7 @@ def test_handler_translates_child_signal_to_shell_exit_code(
     assert cli.handle_cli(argparse.Namespace(claude_command="agents")) == 143
 
 
-def test_registers_two_tools_one_hook_and_one_claude_cli_command() -> None:
+def test_registers_managed_tools_one_hook_and_one_claude_cli_command() -> None:
     context = RecordingContext()
 
     plugin.register(context)
@@ -170,11 +170,19 @@ def test_registers_two_tools_one_hook_and_one_claude_cli_command() -> None:
     assert [item["name"] for item in context.tools] == [
         "claude_session_start",
         "claude_session_list",
+        "claude_permission_list",
+        "claude_permission_decide",
+        "claude_session_logs",
+        "claude_session_stop",
     ]
     assert {item["toolset"] for item in context.tools} == {"claude_sessions"}
     assert [item["schema"] for item in context.tools] == [
         schemas.CLAUDE_SESSION_START,
         schemas.CLAUDE_SESSION_LIST,
+        schemas.CLAUDE_PERMISSION_LIST,
+        schemas.CLAUDE_PERMISSION_DECIDE,
+        schemas.CLAUDE_SESSION_LOGS,
+        schemas.CLAUDE_SESSION_STOP,
     ]
     assert context.hooks == [("pre_tool_call", hooks.pre_tool_call)]
     assert context.cli_commands == [

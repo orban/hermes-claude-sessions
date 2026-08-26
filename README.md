@@ -1,69 +1,90 @@
 # Hermes Claude Sessions
 
-A lean Hermes plugin that starts and lists native Claude background sessions while leaving Claude and the human in control of their native session experience.
+Hermes-managed native Claude background sessions with autonomous permission routing.
 
-## Responsibilities
+## Control model
 
-| Owner | Responsibility |
+| Layer | Responsibility |
 | --- | --- |
-| Hermes | Offers approved model-tool launch/list access and reports controlled results. |
-| Claude native supervisor | Owns session lifecycle, terminal UI, worktrees, permissions, and native status. |
-| Human | Approves launches and uses native terminal handoffs to observe or interact with Claude. |
+| Hermes | Delegates the task, judges residual permission requests, monitors state, reads logs, stops owned sessions, and independently verifies the result. |
+| Claude auto mode | Classifies routine tool actions against the user request, repository context, destructive-operation rules, remotes, and prompt-injection signals. |
+| Permission bridge | Converts any remaining native `PermissionRequest` into a session-scoped request that Hermes can allow or deny once. |
+| Human | Defines the task. No launch or routine Claude permission interaction is required for the default flow. |
 
-## Capabilities
+The default is `--permission-mode auto`. `bypassPermissions` is not exposed.
 
-- Model tools: `claude_session_start` launches native Claude `--bg`; `claude_session_list` reads the native roster/status.
-- Approval hook: `pre_tool_call` requests human approval for a start; it does not decide Claude permissions.
-- Native CLI handoffs: `hermes claude agents` and `hermes claude attach <id>` inherit the actual terminal and are not model tools.
-- Bundled, read-only plugin skill: `claude-sessions:native-claude-sessions`, loaded explicitly through `skill_view`.
+## Model tools
 
-## Safety and non-goals
+- `claude_session_start` — launches one native Claude `--bg` session. Default `permission_mode` is `auto`.
+- `claude_session_list` — reads the authoritative native roster.
+- `claude_permission_list` — lists pending requests waiting for Hermes judgment.
+- `claude_permission_decide` — allows or denies one exact request once. It never installs a persistent allow rule.
+- `claude_session_logs` — reads bounded logs for a session launched by Hermes.
+- `claude_session_stop` — stops an owned session and verifies its terminal state.
 
-This plugin performs no screen scraping or keystroke injection. It does not auto-approve permissions or use `bypassPermissions`, decide Claude hooks, or provide persistence/reconciliation/stop/respawn/cleanup. It never infers state from terminal text. Claude's native supervisor remains authoritative. zmx fallback only: use zmx only when the native supervisor is unavailable and the fallback is explicitly requested.
+The bundled operating procedure is `claude-sessions:native-claude-sessions`.
 
-## Prerequisites and activation
+Auto-mode launches do not invoke the Hermes human approval hook. Explicit `manual`, `acceptEdits`, and `plan` launches remain human-gated.
 
-- Hermes with plugin support.
-- An executable Claude binary. Resolution order is `CLAUDE_BIN`, then `PATH`, then `~/.local/bin/claude`.
-- `CLAUDE_BIN` is a non-secret environment capability; set it to an executable binary when the default resolver cannot find Claude.
+## Managed permission flow
 
-For source development, run from this checkout without changing the active profile:
+1. Hermes launches Claude in `auto` mode with a session-scoped hook plugin.
+2. Claude's classifier handles routine actions.
+3. If Claude emits `PermissionRequest`, the hook writes a bounded JSON request below `$HERMES_HOME/state/claude-sessions/managed/` and blocks.
+4. Hermes calls `claude_permission_list`, evaluates the exact tool and input against the delegated task and working directory, then calls `claude_permission_decide`.
+5. The hook returns Claude's documented one-shot `allow` or `deny` decision and records a resolved audit artifact.
+6. Missing state, malformed input, invalid decisions, and timeouts deny closed.
 
-```sh
-hermes plugins doctor . --ci
-```
+Hermes should allow only actions needed by the user's task. It should deny credential access, authentication changes, permission changes, destructive operations, unrelated process control, uploads, publication, payment, and writes outside the delegated workspace unless the user explicitly authorized that exact effect.
 
-For production, install the plugin through your normal Hermes plugin installation process. This checkout has no configured distribution remote; do not invent GitHub owner/repository coordinates. If placing a source checkout directly in the plugin directory, use `$HERMES_HOME/plugins/claude-sessions`; do not copy the bundled skill into `~/.hermes/skills`.
+## Security boundary
 
-## Model workflow
+This is a governance boundary, not an OS sandbox. Claude and the bridge run as the same local user. The bridge limits control through:
 
-1. Ask the model to call `claude_session_start` with a unique `name`, absolute existing `cwd`, and task `prompt`. Choose `manual` (default), `acceptEdits`, or `plan`.
-2. Review Hermes's approval request; do not bypass permissions.
-3. Use `claude_session_list` when a read-only native roster is needed.
-4. Hand terminal interaction to the human:
+- per-launch random state directories with mode `0700`;
+- request and decision files with mode `0600`;
+- exact one-shot request IDs;
+- no persistent allow-rule output;
+- ownership checks before logs or stop;
+- strict shell-free subprocess argument arrays;
+- prompt redaction and bounded output;
+- fail-closed hook behavior.
+
+The plugin performs no screen scraping or keystroke injection. It never enables `bypassPermissions`.
+
+## Native CLI handoffs
+
+Human observation remains available but is optional:
 
 ```sh
 hermes claude agents
 hermes claude attach <id>
 ```
 
-Errors are returned as controlled results. Do not automatically retry a paid launch.
+These commands inherit the actual terminal.
+
+## Prerequisites and activation
+
+- Hermes with plugin support.
+- An executable Claude binary. Resolution order is `CLAUDE_BIN`, then `PATH`, then `~/.local/bin/claude`.
+
+For source development:
+
+```sh
+hermes plugins doctor . --ci
+```
+
+For production, install through the normal Hermes plugin process. This checkout has no configured distribution remote; do not invent GitHub owner/repository coordinates. A source checkout placed directly in the active profile belongs at `$HERMES_HOME/plugins/claude-sessions`.
 
 ## Development checks
 
-Run the deterministic checks used by this project:
-
 ```sh
-python -m pytest -q
-ruff check .
-ruff format --check .
+python -m pytest --cov=hermes_claude_sessions --cov-branch
+ruff check hermes_claude_sessions tests
+ruff format --check hermes_claude_sessions tests
 mypy hermes_claude_sessions
 hermes plugins doctor . --ci
-git diff --check
+python -m build
 ```
 
-Live Claude characterization is opt-in and may incur cost. Run it only with an executable absolute `CLAUDE_BIN` plus both explicit acknowledgements, `RUN_CLAUDE_CHARACTERIZATION=1` and `CLAUDE_CHARACTERIZATION_ACK_COST=1`; it is not part of normal development verification.
-
-## Native compatibility caveat
-
-The adapter targets the observed native Claude CLI contract (`--bg`, `agents`, and `attach`), not a replacement supervisor. Native Claude CLI behavior can change; characterize a compatible installed binary before relying on live behavior.
+Live Claude characterization remains opt-in because it incurs cost. Set `RUN_CLAUDE_CHARACTERIZATION=1`, `CLAUDE_CHARACTERIZATION_ACK_COST=1`, and an exact executable `CLAUDE_BIN` only for an intentional live run.

@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from .safety import without_prompt
+from .tools import DEFAULT_PERMISSION_MODE
 
 MAX_APPROVAL_FIELD_CHARS = 2_048
 _TRUNCATION_MARKER = "...[truncated]"
@@ -24,18 +25,20 @@ def _bounded_repr(value: Any, prompt: Any) -> str:
 def pre_tool_call(
     tool_name: str, args: Mapping[str, Any], **kwargs: object
 ) -> dict[str, str] | None:
-    """Require Hermes' normal human approval before starting a session."""
+    """Run auto-mode launches unattended; gate every less-managed launch."""
     del kwargs
     if tool_name != "claude_session_start":
         return None
     try:
+        permission_mode = args.get("permission_mode", DEFAULT_PERMISSION_MODE)
+        if permission_mode == "auto":
+            return None
         prompt = args.get("prompt")
         message = (
-            "Approve native Claude session start: "
+            "Approve non-auto native Claude session start: "
             f"name={_bounded_repr(args.get('name'), prompt)}; "
             f"cwd={_bounded_repr(args.get('cwd'), prompt)}; "
-            "permission_mode="
-            f"{_bounded_repr(args.get('permission_mode', 'manual'), prompt)}"
+            f"permission_mode={_bounded_repr(permission_mode, prompt)}"
         )
         redacted_message = without_prompt(message, prompt)
         if isinstance(redacted_message, str):

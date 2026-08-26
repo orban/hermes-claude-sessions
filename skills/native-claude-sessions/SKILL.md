@@ -5,9 +5,13 @@ description: "Use when operating native Claude background sessions."
 
 # Native Claude background sessions
 
-1. Call `claude_session_start` only to launch one native Claude `--bg` session. Supply `name`, absolute existing `cwd`, and `prompt`; use `manual` (default), `acceptEdits`, or `plan`. Hermes requests human approval before launch. Never bypass permissions.
-2. Call `claude_session_list` only for the read-only native roster/status.
-3. Direct a human to `hermes claude agents` to view native agents or `hermes claude attach <id>` to interact. Those commands inherit the actual terminal; they are not model tools.
-4. Let Claude's native supervisor own lifecycle, terminal UI, worktrees, permissions, and native status. Hermes does not scrape, inject keystrokes, reconcile, persist, stop, respawn, or clean up sessions.
-5. Never infer state from terminal text. Do not substitute zmx except as an explicitly requested fallback when the native Claude supervisor is unavailable.
-6. On an error, report the controlled result. Do not retry paid launches automatically.
+1. Call `claude_session_start` with a unique name, absolute existing `cwd`, and a self-contained prompt. Omit `permission_mode` so the default `auto` classifier runs. Auto launches are unattended; never request `bypassPermissions`.
+2. After launch, alternate `claude_session_list` and `claude_permission_list` until the owned session reaches a terminal state. Do not tell the user to attach for routine operation.
+3. For each permission request, compare the exact `tool_name` and `tool_input` with the user's delegated task, the managed working directory, and the smallest necessary effect. Call `claude_permission_decide` once with `allow` or `deny` and a concrete reason.
+4. Allow bounded build, test, lint, formatting, repository inspection, and task-required edit commands inside the delegated workspace. Deny credential access, authentication or permission changes, unrelated process control, destructive commands, uploads/publication, payment, and effects outside the workspace unless the user explicitly authorized that exact effect.
+5. A denial should explain the safe constraint so Claude can adapt. Never install a persistent allow rule. Missing evidence or an ambiguous dangerous effect means deny.
+6. Use `claude_session_logs` for owned-session output. Use `claude_session_stop` if the session is stalled, out of scope, or no longer needed; the tool verifies terminal state.
+7. Independently inspect the produced worktree and run the project's real verification gates before reporting completion. Claude's status or logs are not completion evidence.
+8. `hermes claude agents` and `hermes claude attach <id>` are optional human observation paths, not dependencies of normal delegation.
+9. The bridge performs no screen scraping or keystroke injection, never enables `bypassPermissions`, and must deny closed on malformed input or timeout. Its same-user boundary is governance, not an OS sandbox.
+10. Do not retry a failed paid launch automatically. Diagnose the controlled result first; launch another only when repair requires it and the user's task still authorizes the work.

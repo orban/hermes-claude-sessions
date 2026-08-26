@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hermes-claude-sessions"
-version = "0.1.0"
-description = "Lean Claude native-session adapter for Hermes"
+version = "0.2.0"
+description = "Hermes-managed native Claude sessions with autonomous permission routing"
 requires-python = ">=3.11"
 
 [project.optional-dependencies]
@@ -16,6 +16,13 @@ where = ["."]
 include = ["hermes_claude_sessions*"]
 exclude = ["tests*", "skills*"]
 namespaces = false
+
+[tool.setuptools.package-data]
+hermes_claude_sessions = [
+  "claude_plugin/.claude-plugin/plugin.json",
+  "claude_plugin/hooks/hooks.json",
+  "claude_plugin/hooks/permission_bridge.py",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -1,11 +1,15 @@
 name: claude-sessions
-version: 0.1.0
+version: 0.2.0
 manifest_version: 2
 api_version: 1
 license: MIT
-description: Lean Claude native-session adapter for Hermes.
+description: Hermes-managed native Claude sessions with autonomous permission routing.
 provides_tools:
   - claude_session_start
   - claude_session_list
+  - claude_permission_list
+  - claude_permission_decide
+  - claude_session_logs
+  - claude_session_stop
 provides_hooks:
   - pre_tool_call
