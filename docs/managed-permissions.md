@@ -9,10 +9,10 @@ A user delegates one task to Hermes. Hermes launches a native Claude background 
 1. `claude_session_start` defaults to `permission_mode=auto`.
 2. The launcher creates a random session directory under `$HERMES_HOME/state/claude-sessions/managed/` and passes only that path to a bundled Claude hook plugin.
 3. The native Claude process runs with `--permission-mode auto` and the bundled `PermissionRequest` hook.
-4. A residual request is persisted with its tool name, tool input, Claude session ID, native short ID, managed working directory, and timestamp.
-5. Hermes lists pending requests and makes one explicit `allow` or `deny` decision with a reason.
+4. A residual request and a bounded semantic wake event are persisted before a best-effort Unix datagram signal is sent to the managing Hermes process.
+5. Hermes's durable background-event rail re-enters the originating conversation, lists pending requests, and makes one explicit `allow` or `deny` decision with a reason.
 6. The hook emits Claude's documented `hookSpecificOutput.decision.behavior` response, moves the request to the resolved audit directory, and deletes the pending response.
-7. Hermes continues until the native roster reports a terminal state, reads bounded logs, and independently verifies the repository.
+7. Claude permission/input hooks and the OS-native job-state watcher publish semantic state changes and terminal events through the same rail. Hermes can claim one event with `claude_session_wait`, or the rail wakes a fresh turn, but never both. Hermes then reads the authoritative roster and bounded logs and independently verifies the requested outcome.
 
 ## Decision policy
 

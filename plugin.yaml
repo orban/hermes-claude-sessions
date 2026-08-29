@@ -1,5 +1,5 @@
 name: claude-sessions
-version: 0.2.0
+version: 0.5.0
 manifest_version: 2
 api_version: 1
 license: MIT
@@ -9,6 +9,7 @@ provides_tools:
   - claude_session_list
   - claude_permission_list
   - claude_permission_decide
+  - claude_session_wait
   - claude_session_logs
   - claude_session_stop
 provides_hooks:

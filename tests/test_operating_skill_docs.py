@@ -69,6 +69,7 @@ def test_operating_skill_has_valid_frontmatter_and_safety_boundaries() -> None:
         "claude_session_list",
         "claude_permission_list",
         "claude_permission_decide",
+        "claude_session_wait",
         "claude_session_logs",
         "claude_session_stop",
         "default `auto` classifier",
@@ -78,6 +79,15 @@ def test_operating_skill_has_valid_frontmatter_and_safety_boundaries() -> None:
         "independently inspect",
         "deny closed",
         "Do not retry a failed paid launch automatically",
+        "end the current turn",
+        "never loop over waits, sleeps",
+        "fresh internal turn",
+        "exclusively consumed",
+        "do not route Claude through ZMX, tmux",
+        "model=`fable`, effort=`low`",
+        "model=`sonnet`, effort=`high`",
+        "model=`opus`, effort=`xhigh`",
+        "omit `model` and `effort`",
     ):
         assert required.lower() in text.lower()
 
@@ -90,6 +100,7 @@ def test_readme_documents_ownership_handoffs_and_non_goals() -> None:
         "claude_session_list",
         "claude_permission_list",
         "claude_permission_decide",
+        "claude_session_wait",
         "claude_session_logs",
         "claude_session_stop",
         "--permission-mode auto",
@@ -99,6 +110,7 @@ def test_readme_documents_ownership_handoffs_and_non_goals() -> None:
         "CLAUDE_BIN",
         "PATH",
         "~/.local/bin/claude",
+        "Claude Desktop",
         "$HERMES_HOME/plugins/claude-sessions",
         "no configured distribution remote",
         "do not invent github owner/repository coordinates",
@@ -110,5 +122,9 @@ def test_readme_documents_ownership_handoffs_and_non_goals() -> None:
         "fail-closed",
         "opt-in",
         "cost",
+        "--model",
+        "--effort",
+        "task-based routing",
+        "`fable`/`low`",
     ):
         assert required.lower() in text.lower()

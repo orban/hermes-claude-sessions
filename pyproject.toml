@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hermes-claude-sessions"
-version = "0.2.0"
+version = "0.5.0"
 description = "Hermes-managed native Claude sessions with autonomous permission routing"
 requires-python = ">=3.11"
 
@@ -21,6 +21,7 @@ namespaces = false
 hermes_claude_sessions = [
   "claude_plugin/.claude-plugin/plugin.json",
   "claude_plugin/hooks/hooks.json",
+  "claude_plugin/hooks/event_bridge.py",
   "claude_plugin/hooks/permission_bridge.py",
 ]
 

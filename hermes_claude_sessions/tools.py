@@ -7,17 +7,22 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import time
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from . import bridge
+from . import bridge, events
 from .safety import without_prompt
 
 ALLOWED_PERMISSION_MODES = ("auto", "manual", "acceptEdits", "plan")
+ALLOWED_EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 DEFAULT_PERMISSION_MODE = "auto"
 COMMAND_TIMEOUT_SECONDS = 20
+DEFAULT_WAIT_SECONDS = 600.0
+MAX_WAIT_SECONDS = 600.0
 MAX_OUTPUT_CHARS = 8_192
 LOG_STDOUT_CHARS = 5_500
 LOG_STDERR_CHARS = 1_000
@@ -28,8 +33,36 @@ _NATIVE_ID = re.compile(r"^[0-9a-f]{8}$")
 _CLAUDE_PLUGIN_DIR = Path(__file__).resolve().parent / "claude_plugin"
 
 
+@dataclass(frozen=True, slots=True)
+class StartOptions:
+    name: str
+    prompt: str
+    cwd: Path
+    permission_mode: str
+    model: str | None
+    effort: str | None
+
+
 def _is_executable(path: Path) -> bool:
     return path.is_file() and os.access(path, os.X_OK)
+
+
+def _desktop_version_key(path: Path, root: Path) -> tuple[int, ...]:
+    version = path.relative_to(root).parts[0]
+    try:
+        return tuple(int(part) for part in version.split("."))
+    except ValueError:
+        return ()
+
+
+def _claude_desktop_fallbacks() -> list[Path]:
+    root = Path.home() / "Library" / "Application Support" / "Claude" / "claude-code"
+    candidates = root.glob("*/claude.app/Contents/MacOS/claude")
+    return sorted(
+        (candidate for candidate in candidates if _is_executable(candidate)),
+        key=lambda candidate: _desktop_version_key(candidate, root),
+        reverse=True,
+    )
 
 
 def resolve_claude_bin() -> str | None:
@@ -44,9 +77,13 @@ def resolve_claude_bin() -> str | None:
     if discovered:
         return discovered
 
-    fallback = Path.home() / ".local" / "bin" / "claude"
-    if _is_executable(fallback):
-        return str(fallback)
+    fallbacks = [
+        Path.home() / ".local" / "bin" / "claude",
+        *_claude_desktop_fallbacks(),
+    ]
+    for fallback in fallbacks:
+        if _is_executable(fallback):
+            return str(fallback)
     return None
 
 
@@ -147,7 +184,7 @@ def _list_error(message: str, **details: Any) -> str:
     return _error(message, **compact)
 
 
-def _parse_start_args(args: object) -> tuple[str, str, Path, str] | str:
+def _parse_start_args(args: object) -> StartOptions | str:
     if not isinstance(args, Mapping):
         return _error("arguments must be an object")
 
@@ -170,30 +207,66 @@ def _parse_start_args(args: object) -> tuple[str, str, Path, str] | str:
     if mode not in ALLOWED_PERMISSION_MODES:
         allowed = ", ".join(ALLOWED_PERMISSION_MODES)
         return _error(f"permission_mode must be one of: {allowed}")
-    return name, prompt, path, mode
+
+    model: str | None = None
+    if "model" in args:
+        candidate_model = args.get("model")
+        if not isinstance(candidate_model, str) or not candidate_model.strip():
+            return _error("model must be a non-empty string")
+        model = candidate_model
+
+    effort: str | None = None
+    if "effort" in args:
+        candidate_effort = args.get("effort")
+        if candidate_effort not in ALLOWED_EFFORT_LEVELS:
+            allowed = ", ".join(ALLOWED_EFFORT_LEVELS)
+            return _error(f"effort must be one of: {allowed}")
+        effort = candidate_effort
+
+    return StartOptions(
+        name=name,
+        prompt=prompt,
+        cwd=path,
+        permission_mode=mode,
+        model=model,
+        effort=effort,
+    )
 
 
 def claude_session_start(args: object, **kwargs: object) -> str:
     """Start one native Claude background session without exposing its prompt."""
-    del kwargs
     prompt: str | None = None
     try:
         if isinstance(args, Mapping):
             candidate = args.get("prompt")
             if isinstance(candidate, str):
                 prompt = candidate
-        result = _claude_session_start(args)
+        route = events.capture_route(
+            parent_session_id=str(kwargs.get("session_id") or "")
+        )
+        result = (
+            _claude_session_start(args, route=route)
+            if route
+            else _claude_session_start(args)
+        )
     except Exception:
         result = _error("Claude session start failed unexpectedly")
     return _redact_prompt_from_json(result, prompt)
 
 
-def _claude_session_start(args: object) -> str:
+def _claude_session_start(args: object, *, route: dict[str, Any] | None = None) -> str:
     parsed = _parse_start_args(args)
     if isinstance(parsed, str):
         return parsed
-    name, prompt, cwd, mode = parsed
-    details = {"name": name, "cwd": str(cwd), "mode": mode}
+    details = {
+        "name": parsed.name,
+        "cwd": str(parsed.cwd),
+        "mode": parsed.permission_mode,
+    }
+    if parsed.model is not None:
+        details["model"] = parsed.model
+    if parsed.effort is not None:
+        details["effort"] = parsed.effort
 
     claude_bin = resolve_claude_bin()
     if claude_bin is None:
@@ -211,19 +284,35 @@ def _claude_session_start(args: object) -> str:
         claude_bin,
         "--bg",
         "--name",
-        name,
+        parsed.name,
         "--permission-mode",
-        mode,
+        parsed.permission_mode,
     ]
-    if mode == "auto":
-        managed_session = bridge.create_session(name, cwd)
+    if parsed.model is not None:
+        argv.extend(["--model", parsed.model])
+    if parsed.effort is not None:
+        argv.extend(["--effort", parsed.effort])
+    if parsed.permission_mode == "auto":
+        managed_session = bridge.create_session(
+            parsed.name,
+            parsed.cwd,
+            model=parsed.model,
+            effort=parsed.effort,
+            route=route,
+            event_socket=events.socket_path(),
+        )
         environment = os.environ.copy()
         environment[bridge.SESSION_DIR_ENV] = str(managed_session)
-        argv.extend(["--plugin-dir", str(_CLAUDE_PLUGIN_DIR)])
-    argv.extend(["--", prompt])
+        session_plugin = bridge.create_hook_plugin(
+            managed_session,
+            _CLAUDE_PLUGIN_DIR,
+            python_executable=sys.executable,
+        )
+        argv.extend(["--plugin-dir", str(session_plugin)])
+    argv.extend(["--", parsed.prompt])
 
     run_kwargs: dict[str, Any] = {
-        "cwd": str(cwd),
+        "cwd": str(parsed.cwd),
         "capture_output": True,
         "text": True,
         "timeout": COMMAND_TIMEOUT_SECONDS,
@@ -254,8 +343,8 @@ def _claude_session_start(args: object) -> str:
         "ok": completed.returncode == 0,
         "returncode": completed.returncode,
         **details,
-        "stdout": _bounded_output(completed.stdout, prompt),
-        "stderr": _bounded_output(completed.stderr, prompt),
+        "stdout": _bounded_output(completed.stdout, parsed.prompt),
+        "stderr": _bounded_output(completed.stderr, parsed.prompt),
     }
     if completed.returncode != 0:
         if managed_session is not None:
@@ -275,7 +364,12 @@ def _claude_session_start(args: object) -> str:
                 stderr=payload["stderr"],
             )
         native_id = match.group(1)
-        bridge.set_native_id(managed_session, native_id)
+        bridge.set_native_id(
+            managed_session,
+            native_id,
+            native_state_path=bridge.native_job_state_path(native_id, environment),
+        )
+        events.watch_session(managed_session)
         payload["id"] = native_id
         payload["managed_permissions"] = True
     return _json(payload)
@@ -385,6 +479,51 @@ def claude_permission_decide(args: object, **kwargs: object) -> str:
         )
     except Exception:
         return _error("Claude permission decision failed unexpectedly")
+
+
+def claude_session_wait(args: object, **kwargs: object) -> str:
+    """Block once for a semantic event without racing fresh-turn delivery."""
+    del kwargs
+    if not isinstance(args, Mapping):
+        return _error("arguments must be an object")
+    native_id = args.get("id")
+    if not isinstance(native_id, str) or not _NATIVE_ID.fullmatch(native_id):
+        return _error("id must be eight lowercase hexadecimal characters")
+    if bridge.find_session(native_id) is None:
+        return _error("session is not managed by Hermes")
+    timeout = args.get("timeout_seconds", DEFAULT_WAIT_SECONDS)
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+        return _error("timeout_seconds must be a number")
+    timeout_seconds = float(timeout)
+    if timeout_seconds < 1 or timeout_seconds > MAX_WAIT_SECONDS:
+        return _error(f"timeout_seconds must be between 1 and {int(MAX_WAIT_SECONDS)}")
+    try:
+        event = events.wait_for_event(native_id, timeout_seconds=timeout_seconds)
+    except Exception:
+        return _error("Claude session wait failed unexpectedly")
+    if event is None:
+        return _json(
+            {
+                "ok": True,
+                "id": native_id,
+                "status": "timeout",
+                "event": None,
+            }
+        )
+    model_event = {
+        key: event[key]
+        for key in ("event_id", "kind", "message", "payload", "created_at")
+        if key in event
+    }
+    return _bounded_json(
+        {
+            "ok": True,
+            "id": native_id,
+            "status": "event",
+            "event": model_event,
+        },
+        "Claude session event is too large to return safely",
+    )
 
 
 def _owned_id(args: object) -> tuple[str, str] | str:

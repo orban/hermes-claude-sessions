@@ -52,13 +52,21 @@ def test_managed_launch_uses_auto_classifier_and_permission_plugin(
 
     result = decode(
         tools.claude_session_start(
-            {"name": "managed-test", "cwd": str(repository), "prompt": "work"}
+            {
+                "name": "managed-test",
+                "cwd": str(repository),
+                "prompt": "work",
+                "model": "sonnet",
+                "effort": "high",
+            }
         )
     )
 
     assert result["ok"] is True
     assert result["mode"] == "auto"
     assert result["id"] == "a1b2c3d4"
+    assert result["model"] == "sonnet"
+    assert result["effort"] == "high"
     argv, kwargs = calls[0]
     assert argv[:6] == [
         "/mock/claude",
@@ -68,8 +76,10 @@ def test_managed_launch_uses_auto_classifier_and_permission_plugin(
         "--permission-mode",
         "auto",
     ]
+    assert argv[6:10] == ["--model", "sonnet", "--effort", "high"]
     plugin_index = argv.index("--plugin-dir")
-    assert Path(argv[plugin_index + 1]).is_dir()
+    session_plugin = Path(argv[plugin_index + 1])
+    assert session_plugin.is_dir()
     assert argv[-2:] == ["--", "work"]
     environment = kwargs["env"]
     assert isinstance(environment, dict)
@@ -77,7 +87,39 @@ def test_managed_launch_uses_auto_classifier_and_permission_plugin(
     metadata = json.loads((session_dir / "metadata.json").read_text())
     assert metadata["native_id"] == "a1b2c3d4"
     assert metadata["name"] == "managed-test"
+    assert metadata["model"] == "sonnet"
+    assert metadata["effort"] == "high"
     assert "work" not in json.dumps(metadata)
+    assert session_plugin == session_dir / "claude-plugin"
+    hook_config = json.loads((session_plugin / "hooks" / "hooks.json").read_text())
+    handlers = [
+        handler
+        for groups in hook_config["hooks"].values()
+        for group in groups
+        for handler in group["hooks"]
+    ]
+    assert handlers
+    assert {handler["command"] for handler in handlers} == {tools.sys.executable}
+    assert all(handler["args"][-1] == str(session_dir) for handler in handlers)
+    assert all(Path(handler["args"][0]).is_file() for handler in handlers)
+
+
+def test_route_metadata_is_attached_to_permission_requests(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    monkeypatch.setattr(bridge, "state_root", lambda: tmp_path / "state")
+    session = bridge.create_session("routed", repository, model="opus", effort="xhigh")
+    bridge.set_native_id(session, "a1b2c3d4")
+
+    request = bridge.enqueue_request(
+        session,
+        {"tool_name": "Bash", "tool_input": {"command": "pytest"}},
+    )
+
+    assert request["model"] == "opus"
+    assert request["effort"] == "xhigh"
 
 
 def test_permission_hook_round_trip_allows_once(
@@ -137,14 +179,9 @@ def test_executable_permission_hook_round_trip(
     session = prepare_session(monkeypatch, tmp_path)
     executable = tools._CLAUDE_PLUGIN_DIR / "hooks" / "permission_bridge.py"
     environment = os.environ.copy()
-    environment.update(
-        {
-            bridge.SESSION_DIR_ENV: str(session),
-            bridge.TIMEOUT_ENV: "2",
-        }
-    )
+    environment[bridge.TIMEOUT_ENV] = "2"
     process = subprocess.Popen(
-        [str(executable)],
+        [str(executable), str(session)],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,

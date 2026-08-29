@@ -38,7 +38,9 @@ def pre_tool_call(
             "Approve non-auto native Claude session start: "
             f"name={_bounded_repr(args.get('name'), prompt)}; "
             f"cwd={_bounded_repr(args.get('cwd'), prompt)}; "
-            f"permission_mode={_bounded_repr(permission_mode, prompt)}"
+            f"permission_mode={_bounded_repr(permission_mode, prompt)}; "
+            f"model={_bounded_repr(args.get('model'), prompt)}; "
+            f"effort={_bounded_repr(args.get('effort'), prompt)}"
         )
         redacted_message = without_prompt(message, prompt)
         if isinstance(redacted_message, str):

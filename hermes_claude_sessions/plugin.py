@@ -6,7 +6,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
-from . import cli, hooks, schemas, tools
+from . import cli, events, hooks, schemas, tools
 
 _SKILL_PATH = (
     Path(__file__).resolve().parents[1]
@@ -48,6 +48,7 @@ def register(ctx: object) -> None:
     """Register managed native-session tools, lifecycle controls, and launch policy."""
     if not isinstance(ctx, PluginContext):
         return
+    events.configure_context(ctx)
     registrations = (
         (
             "claude_session_start",
@@ -68,6 +69,11 @@ def register(ctx: object) -> None:
             "claude_permission_decide",
             schemas.CLAUDE_PERMISSION_DECIDE,
             tools.claude_permission_decide,
+        ),
+        (
+            "claude_session_wait",
+            schemas.CLAUDE_SESSION_WAIT,
+            tools.claude_session_wait,
         ),
         (
             "claude_session_logs",

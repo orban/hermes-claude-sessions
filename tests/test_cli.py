@@ -172,6 +172,7 @@ def test_registers_managed_tools_one_hook_and_one_claude_cli_command() -> None:
         "claude_session_list",
         "claude_permission_list",
         "claude_permission_decide",
+        "claude_session_wait",
         "claude_session_logs",
         "claude_session_stop",
     ]
@@ -181,6 +182,7 @@ def test_registers_managed_tools_one_hook_and_one_claude_cli_command() -> None:
         schemas.CLAUDE_SESSION_LIST,
         schemas.CLAUDE_PERMISSION_LIST,
         schemas.CLAUDE_PERMISSION_DECIDE,
+        schemas.CLAUDE_SESSION_WAIT,
         schemas.CLAUDE_SESSION_LOGS,
         schemas.CLAUDE_SESSION_STOP,
     ]

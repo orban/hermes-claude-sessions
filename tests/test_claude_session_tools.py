@@ -58,6 +58,22 @@ def test_schemas_describe_only_native_background_sessions() -> None:
         "enum": ["auto", "manual", "acceptEdits", "plan"],
         "default": "auto",
     }
+    assert start["parameters"]["properties"]["model"] == {
+        "type": "string",
+        "minLength": 1,
+        "description": (
+            "Claude model alias or full provider model name for this session. "
+            "Omit to use Claude's configured default."
+        ),
+    }
+    assert start["parameters"]["properties"]["effort"] == {
+        "type": "string",
+        "enum": ["low", "medium", "high", "xhigh", "max"],
+        "description": (
+            "Claude reasoning effort for this session. Omit to use the model's "
+            "configured default."
+        ),
+    }
     assert "native Claude background session" in start["description"]
     assert listing["name"] == "claude_session_list"
     assert listing["parameters"] == {"type": "object", "properties": {}}
@@ -97,6 +113,7 @@ def test_start_uses_exact_shell_free_argv_and_default_mode(
         "managed_permissions": True,
     }
     argv = calls[0]["args"][0]
+    session_plugin = Path(argv[7])
     assert argv == [
         "/mock/claude",
         "--bg",
@@ -105,14 +122,16 @@ def test_start_uses_exact_shell_free_argv_and_default_mode(
         "--permission-mode",
         "auto",
         "--plugin-dir",
-        str(tools._CLAUDE_PLUGIN_DIR),
+        str(session_plugin),
         "--",
         "secret prompt",
     ]
     kwargs = dict(calls[0]["kwargs"])
     environment = kwargs.pop("env")
     assert isinstance(environment, dict)
-    assert Path(environment[bridge.SESSION_DIR_ENV]).parent == tmp_path / "state"
+    session_dir = Path(environment[bridge.SESSION_DIR_ENV])
+    assert session_dir.parent == tmp_path / "state"
+    assert session_plugin == session_dir / "claude-plugin"
     assert kwargs == {
         "cwd": str(tmp_path),
         "capture_output": True,
@@ -121,6 +140,59 @@ def test_start_uses_exact_shell_free_argv_and_default_mode(
         "shell": False,
         "check": False,
     }
+
+
+def test_start_routes_explicit_model_and_effort_in_shell_free_argv(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        del kwargs
+        calls.append(argv)
+        return subprocess.CompletedProcess(
+            argv, 0, "backgrounded · a1b2c3d4 · routed-review", ""
+        )
+
+    monkeypatch.setattr(tools, "resolve_claude_bin", lambda: "/mock/claude")
+    monkeypatch.setattr(bridge, "state_root", lambda: tmp_path / "state")
+    monkeypatch.setattr(tools.subprocess, "run", fake_run)
+
+    result = decode(
+        tools.claude_session_start(
+            {
+                "name": "routed-review",
+                "cwd": str(tmp_path),
+                "prompt": "review the concurrency boundary",
+                "model": "opus",
+                "effort": "xhigh",
+            }
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["model"] == "opus"
+    assert result["effort"] == "xhigh"
+    session_plugin = Path(calls[0][11])
+    assert calls == [
+        [
+            "/mock/claude",
+            "--bg",
+            "--name",
+            "routed-review",
+            "--permission-mode",
+            "auto",
+            "--model",
+            "opus",
+            "--effort",
+            "xhigh",
+            "--plugin-dir",
+            str(session_plugin),
+            "--",
+            "review the concurrency boundary",
+        ]
+    ]
+    assert session_plugin.parent.parent == tmp_path / "state"
 
 
 @pytest.mark.parametrize("mode", ["auto", "manual", "acceptEdits", "plan"])
@@ -180,6 +252,39 @@ def test_start_accepts_each_allowed_mode(
         (
             {"name": "job", "cwd": "/", "prompt": "work", "permission_mode": "yolo"},
             "permission_mode must be one of: auto, manual, acceptEdits, plan",
+        ),
+        (
+            {"name": "job", "cwd": "/", "prompt": "work", "model": 42},
+            "model must be a non-empty string",
+        ),
+        (
+            {"name": "job", "cwd": "/", "prompt": "work", "model": None},
+            "model must be a non-empty string",
+        ),
+        (
+            {"name": "job", "cwd": "/", "prompt": "work", "model": "   "},
+            "model must be a non-empty string",
+        ),
+        (
+            {"name": "job", "cwd": "/", "prompt": "work", "effort": 42},
+            "effort must be one of: low, medium, high, xhigh, max",
+        ),
+        (
+            {"name": "job", "cwd": "/", "prompt": "work", "effort": None},
+            "effort must be one of: low, medium, high, xhigh, max",
+        ),
+        (
+            {"name": "job", "cwd": "/", "prompt": "work", "effort": "auto"},
+            "effort must be one of: low, medium, high, xhigh, max",
+        ),
+        (
+            {
+                "name": "job",
+                "cwd": "/",
+                "prompt": "work",
+                "effort": "ultracode",
+            },
+            "effort must be one of: low, medium, high, xhigh, max",
         ),
     ],
 )
@@ -314,6 +419,25 @@ def test_resolver_precedence(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) ->
     local_binary.chmod(0o755)
     monkeypatch.setattr(tools.Path, "home", classmethod(lambda cls: tmp_path))
     assert tools.resolve_claude_bin() == str(local_binary)
+
+
+def test_resolver_uses_newest_executable_claude_desktop_bundle(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "Library" / "Application Support" / "Claude" / "claude-code"
+    older = root / "2.1.99" / "claude.app" / "Contents" / "MacOS" / "claude"
+    newer = root / "2.1.246" / "claude.app" / "Contents" / "MacOS" / "claude"
+    non_executable = root / "2.2.0" / "claude.app" / "Contents" / "MacOS" / "claude"
+    for binary in (older, newer, non_executable):
+        binary.parent.mkdir(parents=True)
+        binary.touch()
+    older.chmod(0o755)
+    newer.chmod(0o755)
+    monkeypatch.delenv("CLAUDE_BIN", raising=False)
+    monkeypatch.setattr(tools.shutil, "which", lambda _: None)
+    monkeypatch.setattr(tools.Path, "home", classmethod(lambda cls: tmp_path))
+
+    assert tools.resolve_claude_bin() == str(newer)
 
 
 def test_resolver_returns_none_when_no_executable_exists(
@@ -691,6 +815,8 @@ def test_approval_hook_only_requests_start_without_prompt() -> None:
             "cwd": "/tmp/work",
             "prompt": prompt,
             "permission_mode": "plan",
+            "model": "opus",
+            "effort": "high",
         },
         task_id="ignored",
     )
@@ -701,6 +827,8 @@ def test_approval_hook_only_requests_start_without_prompt() -> None:
     assert "job" in approval["message"]
     assert "/tmp/work" in approval["message"]
     assert "plan" in approval["message"]
+    assert "model='opus'" in approval["message"]
+    assert "effort='high'" in approval["message"]
     assert hooks.pre_tool_call("claude_session_list", {}, task_id="ignored") is None
     assert hooks.pre_tool_call("other", {"prompt": prompt}, task_id="ignored") is None
 
@@ -732,7 +860,7 @@ def test_approval_hook_handles_unavailable_or_nonstring_metadata() -> None:
     }
 
 
-@pytest.mark.parametrize("alias", ["name", "cwd", "permission_mode"])
+@pytest.mark.parametrize("alias", ["name", "cwd", "permission_mode", "model", "effort"])
 def test_prompt_is_redacted_when_it_aliases_disclosed_fields(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, alias: str
 ) -> None:
@@ -740,6 +868,8 @@ def test_prompt_is_redacted_when_it_aliases_disclosed_fields(
         "name": "job",
         "cwd": str(tmp_path),
         "permission_mode": "manual",
+        "model": "opus",
+        "effort": "high",
     }
     prompt = values[alias]
     args = {**values, "prompt": prompt}
@@ -783,6 +913,26 @@ def test_prompt_substrings_are_redacted_from_disclosed_fields(
     assert prompt not in approval["message"]
 
 
+@pytest.mark.parametrize("alias", ["model", "effort"])
+def test_approval_hook_redacts_long_prompt_aliases(alias: str) -> None:
+    sensitive_prefix = "sensitive-route-prefix"
+    prompt = sensitive_prefix + ("x" * (hooks.MAX_APPROVAL_FIELD_CHARS + 100))
+    args = {
+        "name": "job",
+        "cwd": "/tmp/work",
+        "prompt": prompt,
+        "permission_mode": "manual",
+        "model": "opus",
+        "effort": "high",
+    }
+    args[alias] = prompt
+
+    approval = hooks.pre_tool_call("claude_session_start", args)
+
+    assert approval is not None
+    assert sensitive_prefix not in approval["message"]
+
+
 def test_prompt_redaction_preserves_json_structure(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -816,6 +966,7 @@ def test_registers_managed_tools_and_one_pre_tool_hook() -> None:
         "claude_session_list",
         "claude_permission_list",
         "claude_permission_decide",
+        "claude_session_wait",
         "claude_session_logs",
         "claude_session_stop",
     ]
@@ -825,6 +976,7 @@ def test_registers_managed_tools_and_one_pre_tool_hook() -> None:
         schemas.CLAUDE_SESSION_LIST,
         schemas.CLAUDE_PERMISSION_LIST,
         schemas.CLAUDE_PERMISSION_DECIDE,
+        schemas.CLAUDE_SESSION_WAIT,
         schemas.CLAUDE_SESSION_LOGS,
         schemas.CLAUDE_SESSION_STOP,
     ]
@@ -847,10 +999,11 @@ def test_manifest_declares_managed_tools_and_hook() -> None:
         "claude_session_list",
         "claude_permission_list",
         "claude_permission_decide",
+        "claude_session_wait",
         "claude_session_logs",
         "claude_session_stop",
     ):
         assert f"  - {tool_name}\n" in manifest
     assert "provides_hooks:\n  - pre_tool_call" in manifest
-    assert manifest.count("  - claude_") == 6
+    assert manifest.count("  - claude_") == 7
     assert manifest.count("  - pre_tool_call") == 1

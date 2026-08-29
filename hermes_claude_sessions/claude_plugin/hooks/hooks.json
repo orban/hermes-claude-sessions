@@ -12,6 +12,55 @@
           }
         ]
       }
+    ],
+    "Notification": [
+      {
+        "matcher": "agent_needs_input|agent_completed",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/event_bridge.py",
+            "args": [],
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/event_bridge.py",
+            "args": [],
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/event_bridge.py",
+            "args": [],
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/event_bridge.py",
+            "args": [],
+            "timeout": 10
+          }
+        ]
+      }
     ]
   }
 }

@@ -69,7 +69,7 @@ def test_distribution_contains_only_runtime_package_at_manifest_version() -> Non
         if line.startswith("version:")
     )
 
-    assert config["project"]["version"] == manifest_version == "0.2.0"
+    assert config["project"]["version"] == manifest_version == "0.5.0"
     discovery = config["tool"]["setuptools"]["packages"]["find"]
     assert discovery["include"] == ["hermes_claude_sessions*"]
     assert discovery["exclude"] == ["tests*", "skills*"]
@@ -80,5 +80,6 @@ def test_distribution_contains_only_runtime_package_at_manifest_version() -> Non
     assert package_data["hermes_claude_sessions"] == [
         "claude_plugin/.claude-plugin/plugin.json",
         "claude_plugin/hooks/hooks.json",
+        "claude_plugin/hooks/event_bridge.py",
         "claude_plugin/hooks/permission_bridge.py",
     ]

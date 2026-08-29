@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
-from .tools import ALLOWED_PERMISSION_MODES, DEFAULT_PERMISSION_MODE
+from .tools import (
+    ALLOWED_EFFORT_LEVELS,
+    ALLOWED_PERMISSION_MODES,
+    DEFAULT_PERMISSION_MODE,
+)
 
 CLAUDE_SESSION_START: dict[str, object] = {
     "name": "claude_session_start",
     "description": (
         "Start one native Claude background session. Auto mode is the unattended "
         "default: Claude's classifier decides routine actions and residual permission "
-        "requests are routed back to Hermes."
+        "requests are routed back to Hermes. Accepts per-task model and reasoning "
+        "effort routing."
     ),
     "parameters": {
         "type": "object",
@@ -24,6 +29,22 @@ CLAUDE_SESSION_START: dict[str, object] = {
                 "type": "string",
                 "enum": list(ALLOWED_PERMISSION_MODES),
                 "default": DEFAULT_PERMISSION_MODE,
+            },
+            "model": {
+                "type": "string",
+                "minLength": 1,
+                "description": (
+                    "Claude model alias or full provider model name for this session. "
+                    "Omit to use Claude's configured default."
+                ),
+            },
+            "effort": {
+                "type": "string",
+                "enum": list(ALLOWED_EFFORT_LEVELS),
+                "description": (
+                    "Claude reasoning effort for this session. Omit to use the model's "
+                    "configured default."
+                ),
             },
         },
         "required": ["name", "cwd", "prompt"],
@@ -66,6 +87,28 @@ CLAUDE_PERMISSION_DECIDE: dict[str, object] = {
             },
         },
         "required": ["request_id", "decision", "reason"],
+    },
+}
+
+CLAUDE_SESSION_WAIT: dict[str, object] = {
+    "name": "claude_session_wait",
+    "description": (
+        "Wait once for the next semantic event from an owned Claude session. "
+        "An event returned here is exclusively consumed and will not also trigger "
+        "a fresh Hermes turn."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "id": {"type": "string", "pattern": "^[0-9a-f]{8}$"},
+            "timeout_seconds": {
+                "type": "number",
+                "minimum": 1,
+                "maximum": 600,
+                "default": 600,
+            },
+        },
+        "required": ["id"],
     },
 }
 

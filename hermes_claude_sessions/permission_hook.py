@@ -73,6 +73,18 @@ def run(
         if not (session / "metadata.json").is_file():
             raise ValueError("managed session state is unavailable")
         request = bridge.enqueue_request(session, payload)
+        bridge.enqueue_event(
+            session,
+            kind="permission_required",
+            message=(
+                "Managed Claude session is waiting for a permission decision. "
+                "Inspect it with claude_permission_list and decide only against "
+                "the delegated task."
+            ),
+            event_id=f"permission-{request['request_id']}",
+            payload={"request_id": request["request_id"]},
+        )
+        bridge.signal_dispatcher(session)
         deadline = time.monotonic() + _timeout(environ)
         while time.monotonic() < deadline:
             response = bridge.read_response(session, str(request["request_id"]))
@@ -104,8 +116,11 @@ def run(
         return 0
 
 
-def main() -> int:
-    return run(stdin=sys.stdin, stdout=sys.stdout, environ=os.environ)
+def main(*, session_dir: str | None = None) -> int:
+    environ = dict(os.environ)
+    if session_dir:
+        environ[bridge.SESSION_DIR_ENV] = session_dir
+    return run(stdin=sys.stdin, stdout=sys.stdout, environ=environ)
 
 
 if __name__ == "__main__":
