@@ -20,14 +20,28 @@ MAX_REQUEST_BYTES = 131_072
 MAX_PENDING_REQUESTS = 20
 MAX_REASON_CHARS = 2_048
 _REQUEST_ID = re.compile(r"^[0-9a-f]{32}$")
+_SESSION_UUID = re.compile(r"^[0-9a-f]{32}$")
 _NATIVE_ID = re.compile(r"^[0-9a-f]{8}$")
 _EVENT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 MAX_EVENT_MESSAGE_CHARS = 4_096
 MAX_EVENT_PAYLOAD_BYTES = 16_384
 MAX_PENDING_EVENTS = 1_000
-EVENT_CLAIM_STALE_SECONDS = 60.0
+EVENT_CLAIM_STALE_SECONDS = 660.0
+# A wake publish that keeps failing is retried this many times, then dead-lettered.
+MAX_PUBLISH_ATTEMPTS = 5
+# Mirrors the Hermes core rule: a wake needs at least one of these to route.
+_ROUTABLE_FIELDS = ("session_key", "origin_ui_session_id", "origin_session_id")
+EVENT_DISPOSITIONS = ("published", "consumed", "undeliverable")
 EVENT_WAITER_STALE_SECONDS = 660.0
 EVENT_SOCKET_ENV = "HERMES_CLAUDE_EVENT_SOCKET"
+STALE_SESSION_TEMP_SECONDS = 3_600.0
+STALE_ATOMIC_TEMP_SECONDS = 3_600.0
+_TERMINAL_REQUEST_REASON = (
+    "Managed Claude session became terminal before permission resolution"
+)
+_SESSION_TEMP = re.compile(r"^\.[0-9a-f]{32}\.[0-9a-f]{32}\.tmp$")
+_ATOMIC_TEMP = re.compile(r"^\..+\.[0-9a-f]{32}\.tmp$")
+_TERMINAL_STATES = {"completed", "done", "failed", "stopped", "terminated"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,6 +60,91 @@ def state_root() -> Path:
     return hermes_home / "state" / "claude-sessions" / "managed"
 
 
+def managed_session_directories() -> list[Path]:
+    """Return only fully published managed-session directories."""
+    root = state_root()
+    if not root.is_dir():
+        return []
+    return sorted(
+        path
+        for path in root.iterdir()
+        if path.is_dir() and _SESSION_UUID.fullmatch(path.name)
+    )
+
+
+def _sweep_stale_session_temps(root: Path, *, now: float | None = None) -> int:
+    current_time = time.time() if now is None else now
+    removed = 0
+    for path in root.iterdir():
+        if not path.is_dir() or not _SESSION_TEMP.fullmatch(path.name):
+            continue
+        try:
+            age = max(0.0, current_time - path.stat().st_mtime)
+        except OSError:
+            continue
+        if age < STALE_SESSION_TEMP_SECONDS:
+            continue
+        shutil.rmtree(path, ignore_errors=True)
+        if not path.exists():
+            removed += 1
+    return removed
+
+
+def sweep_stale_atomic_temps(*, now: float | None = None) -> int:
+    """Remove only old adapter-owned atomic-write leftovers from known state dirs."""
+    current_time = time.time() if now is None else now
+    directories = [state_root().parent / "by-native"]
+    for session in managed_session_directories():
+        directories.extend(
+            [
+                session,
+                session / "requests",
+                session / "responses",
+                session / "resolving",
+                session / "resolved",
+                session / "events" / "pending",
+                session / "events" / "claimed",
+                session / "events" / "waiters",
+                session / "events" / "published",
+                session / "events" / "consumed",
+            ]
+        )
+    removed = 0
+    for directory in directories:
+        if not directory.is_dir():
+            continue
+        for path in directory.iterdir():
+            if not path.is_file() or not _ATOMIC_TEMP.fullmatch(path.name):
+                continue
+            try:
+                age = max(0.0, current_time - path.stat().st_mtime)
+            except OSError:
+                continue
+            if age < STALE_ATOMIC_TEMP_SECONDS:
+                continue
+            path.unlink(missing_ok=True)
+            if not path.exists():
+                removed += 1
+    return removed
+
+
+def native_binding_path(native_id: str) -> Path:
+    return state_root().parent / "by-native" / f"{native_id}.json"
+
+
+def _fsync_directory(path: Path) -> None:
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    except OSError:
+        return
+    try:
+        os.fsync(descriptor)
+    except OSError:
+        pass
+    finally:
+        os.close(descriptor)
+
+
 def _write_json_atomic(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
@@ -57,22 +156,29 @@ def _write_json_atomic(path: Path, value: dict[str, Any]) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
+        _fsync_directory(path.parent)
     finally:
         temporary.unlink(missing_ok=True)
 
 
 def _write_json_exclusive(path: Path, value: dict[str, Any]) -> bool:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     try:
-        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
-        return False
-    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-        json.dump(value, stream, ensure_ascii=False, sort_keys=True)
-        stream.write("\n")
-        stream.flush()
-        os.fsync(stream.fileno())
-    return True
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(value, stream, ensure_ascii=False, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            return False
+        _fsync_directory(path.parent)
+        return True
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _read_json(path: Path) -> dict[str, Any] | None:
@@ -98,34 +204,48 @@ def create_session(
     root = state_root()
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(root, 0o700)
+    _sweep_stale_session_temps(root)
     session = root / uuid.uuid4().hex
-    session.mkdir(mode=0o700)
-    for child in (
-        "requests",
-        "responses",
-        "resolved",
-        "events/pending",
-        "events/claimed",
-        "events/waiters",
-        "events/published",
-        "events/consumed",
-    ):
-        (session / child).mkdir(parents=True, mode=0o700)
-    _write_json_atomic(
-        session / "metadata.json",
-        {
-            "version": 2,
-            "name": name,
-            "cwd": str(resolved_cwd),
-            "model": model,
-            "effort": effort,
-            "native_id": None,
-            "route": dict(route or {}),
-            "event_socket": event_socket,
-            "created_at": time.time(),
-        },
-    )
-    return session
+    temporary = root / f".{session.name}.{uuid.uuid4().hex}.tmp"
+    temporary.mkdir(mode=0o700)
+    try:
+        for child in (
+            "requests",
+            "responses",
+            "resolving",
+            "resolved",
+            "events/pending",
+            "events/claimed",
+            "events/waiters",
+            "events/published",
+            "events/consumed",
+        ):
+            (temporary / child).mkdir(parents=True, mode=0o700)
+        launch_id = uuid.uuid4().hex
+        _write_json_atomic(
+            temporary / "metadata.json",
+            {
+                "version": 3,
+                "session_uuid": session.name,
+                "name": name,
+                "cwd": str(resolved_cwd),
+                "model": model,
+                "effort": effort,
+                "native_id": None,
+                "launch_state": "intent",
+                "launch_id": launch_id,
+                "launch_name": f"{name}-{launch_id[:8]}",
+                "route": dict(route or {}),
+                "event_socket": event_socket,
+                "created_at": time.time(),
+            },
+        )
+        os.replace(temporary, session)
+        _fsync_directory(root)
+        return session
+    except Exception:
+        shutil.rmtree(temporary, ignore_errors=True)
+        raise
 
 
 def create_hook_plugin(
@@ -133,6 +253,7 @@ def create_hook_plugin(
     source_plugin: Path,
     *,
     python_executable: str,
+    include_permission_hook: bool = True,
 ) -> Path:
     """Materialize launch-specific hooks with an explicit trusted state argument."""
     hooks_template = _read_json(source_plugin / "hooks" / "hooks.json")
@@ -142,6 +263,8 @@ def create_hook_plugin(
     hooks = hooks_template.get("hooks")
     if not isinstance(hooks, dict):
         raise ValueError("Claude hook plugin template is invalid")
+    if not include_permission_hook:
+        hooks.pop("PermissionRequest", None)
     source_hooks = (source_plugin / "hooks").resolve()
     for groups in hooks.values():
         if not isinstance(groups, list):
@@ -180,7 +303,16 @@ def remove_session(session: Path) -> None:
         session.resolve().relative_to(state_root().resolve())
     except (OSError, ValueError):
         return
+    metadata = _read_json(session / "metadata.json")
+    native_id = metadata.get("native_id") if metadata else None
+    if isinstance(native_id, str) and _NATIVE_ID.fullmatch(native_id):
+        binding = native_binding_path(native_id)
+        record = _read_json(binding)
+        if record is not None and record.get("session_uuid") == session.name:
+            binding.unlink(missing_ok=True)
+            _fsync_directory(binding.parent)
     shutil.rmtree(session, ignore_errors=True)
+    _fsync_directory(state_root())
 
 
 def native_job_state_path(
@@ -192,11 +324,22 @@ def native_job_state_path(
     return claude_home / "jobs" / native_id / "state.json"
 
 
+def _metadata_native_state_path(metadata: dict[str, Any]) -> Path | None:
+    raw_path = metadata.get("native_state_path")
+    if isinstance(raw_path, str) and raw_path:
+        return Path(raw_path)
+    native_id = metadata.get("native_id")
+    if isinstance(native_id, str) and _NATIVE_ID.fullmatch(native_id):
+        return native_job_state_path(native_id)
+    return None
+
+
 def set_native_id(
     session: Path,
     native_id: str,
     *,
     native_state_path: Path | None = None,
+    preserve_launch_state: bool = False,
 ) -> None:
     if not _NATIVE_ID.fullmatch(native_id):
         raise ValueError(
@@ -206,10 +349,33 @@ def set_native_id(
     metadata = _read_json(metadata_path)
     if metadata is None:
         raise ValueError("managed session metadata is unavailable")
+    current_native_id = metadata.get("native_id")
+    if current_native_id not in {None, native_id}:
+        raise ValueError("managed session is already bound to another native id")
+    binding = native_binding_path(native_id)
+    binding.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    claim = {
+        "version": 1,
+        "native_id": native_id,
+        "session_uuid": session.name,
+        "launch_id": metadata.get("launch_id"),
+        "created_at": time.time(),
+    }
+    if not _write_json_exclusive(binding, claim):
+        existing = _read_json(binding)
+        if existing is None or existing.get("session_uuid") != session.name:
+            raise ValueError("native session id is already bound")
     metadata["native_id"] = native_id
     metadata["native_state_path"] = str(
         native_state_path or native_job_state_path(native_id)
     )
+    if preserve_launch_state:
+        metadata["launch_state"] = (
+            "bound" if metadata.get("launch_state") == "bound" else "legacy"
+        )
+    else:
+        metadata["launch_state"] = "bound"
+        metadata["bound_at"] = time.time()
     _write_json_atomic(metadata_path, metadata)
 
 
@@ -217,17 +383,45 @@ def find_session(native_id: str) -> Path | None:
     if not _NATIVE_ID.fullmatch(native_id):
         return None
     root = state_root()
+    binding = native_binding_path(native_id)
+    if binding.exists():
+        record = _read_json(binding)
+        session_uuid = record.get("session_uuid") if record else None
+        if not isinstance(session_uuid, str) or not _SESSION_UUID.fullmatch(
+            session_uuid
+        ):
+            return None
+        session = root / session_uuid
+        metadata = _read_json(session / "metadata.json")
+        if metadata is None or metadata.get("native_id") != native_id:
+            return None
+        return session
     if not root.is_dir():
         return None
-    for session in sorted(root.iterdir()):
+    candidates: list[Path] = []
+    for session in managed_session_directories():
         metadata = _read_json(session / "metadata.json")
         if metadata is not None and metadata.get("native_id") == native_id:
-            return session
-    return None
+            candidates.append(session)
+    if len(candidates) != 1:
+        return None
+    session = candidates[0]
+    try:
+        set_native_id(session, native_id, preserve_launch_state=True)
+    except ValueError:
+        return None
+    return session
+
+
+def route_is_deliverable(route: Mapping[str, Any] | None) -> bool:
+    """Whether the host could ever route a wake for ``route`` (core identity rule)."""
+    if not isinstance(route, Mapping):
+        return False
+    return any(str(route.get(field) or "") for field in _ROUTABLE_FIELDS)
 
 
 def _existing_event(session: Path, event_id: str) -> dict[str, Any] | None:
-    for disposition in ("pending", "published", "consumed"):
+    for disposition in ("pending", *EVENT_DISPOSITIONS):
         event = _read_json(session / "events" / disposition / f"{event_id}.json")
         if event is not None:
             return event
@@ -240,18 +434,22 @@ def _existing_event(session: Path, event_id: str) -> dict[str, Any] | None:
     return None
 
 
+def event_exists(session: Path, event_id: str) -> bool:
+    """Return whether a durable event exists in any delivery state."""
+    return _existing_event(session, event_id) is not None
+
+
 def native_state_watch_directories() -> set[Path]:
     """Return existing directories whose vnode changes can signal job updates."""
     directories: set[Path] = set()
     root = state_root()
     if not root.is_dir():
         return directories
-    for session in root.iterdir():
+    for session in managed_session_directories():
         metadata = _read_json(session / "metadata.json")
-        raw_path = metadata.get("native_state_path") if metadata else None
-        if not isinstance(raw_path, str) or not raw_path:
+        state_path = _metadata_native_state_path(metadata) if metadata else None
+        if state_path is None:
             continue
-        state_path = Path(raw_path)
         job_dir = state_path.parent
         jobs_root = job_dir.parent
         if job_dir.is_dir():
@@ -261,58 +459,144 @@ def native_state_watch_directories() -> set[Path]:
     return directories
 
 
-def enqueue_native_terminal_events() -> int:
-    """Convert authoritative Claude job-state transitions into semantic events."""
+def enqueue_terminal_event(session: Path, native_state: str) -> bool:
+    """Persist one stable terminal event from an authoritative native observation."""
+    event_id = f"terminal-{session.name}"
+    if _existing_event(session, event_id) is not None:
+        return False
+    if native_state == "failed":
+        kind = "failed"
+        message = (
+            "Managed Claude session failed. Inspect its authoritative logs and "
+            "verify any partial artifacts before deciding whether to retry."
+        )
+    elif native_state in {"stopped", "terminated", "missing"}:
+        kind = "session_ended"
+        message = (
+            "Managed Claude session ended. Inspect its archived logs and verify any "
+            "produced artifacts."
+        )
+    elif native_state in {"completed", "done"}:
+        kind = "completed"
+        message = (
+            "Managed Claude session completed. Read its logs, inspect the artifacts, "
+            "and independently verify the work."
+        )
+    else:
+        return False
+    enqueue_event(
+        session,
+        kind=kind,
+        message=message,
+        event_id=event_id,
+        payload={"native_state": native_state},
+    )
+    signal_dispatcher(session)
+    return True
+
+
+def enqueue_native_state_events() -> int:
+    """Convert state-file hints into nonterminal events and lifecycle wakeups."""
     root = state_root()
     if not root.is_dir():
         return 0
     enqueued = 0
-    for session in sorted(path for path in root.iterdir() if path.is_dir()):
+    for session in managed_session_directories():
         metadata = _read_json(session / "metadata.json")
-        raw_path = metadata.get("native_state_path") if metadata else None
-        if not isinstance(raw_path, str) or not raw_path:
+        state_path = _metadata_native_state_path(metadata) if metadata else None
+        if state_path is None:
             continue
-        state_record = _read_json(Path(raw_path))
+        try:
+            before = state_path.stat().st_mtime_ns
+            state_record = _read_json(state_path)
+            after = state_path.stat().st_mtime_ns
+        except OSError:
+            continue
+        if before != after:
+            continue
         state = str(state_record.get("state") or "") if state_record else ""
-        if state not in {
-            "completed",
-            "done",
-            "failed",
-            "stopped",
-            "terminated",
-        }:
+        if not state:
             continue
-        event_id = f"terminal-{session.name}"
-        if _existing_event(session, event_id) is not None:
+        observation_path = session / "native-observation.json"
+        observation = _read_json(observation_path) or {}
+        last_state = str(observation.get("state") or "")
+        raw_generation = observation.get("blocked_generation")
+        blocked_generation = (
+            int(raw_generation)
+            if isinstance(raw_generation, int) and raw_generation >= 0
+            else 0
+        )
+        if state in _TERMINAL_STATES:
+            if last_state != state:
+                _write_json_atomic(
+                    observation_path,
+                    {
+                        "version": 1,
+                        "state": state,
+                        "blocked_generation": blocked_generation,
+                        "observed_at": time.time(),
+                    },
+                )
+                signal_dispatcher(session)
             continue
-        if state == "failed":
-            kind = "failed"
+        if state == "blocked":
+            if last_state == "blocked":
+                continue
+            if any((session / "requests").glob("*.json")):
+                _write_json_atomic(
+                    observation_path,
+                    {
+                        "version": 1,
+                        "state": state,
+                        "blocked_generation": blocked_generation,
+                        "observed_at": time.time(),
+                    },
+                )
+                continue
+            blocked_generation += 1
+            event_id = f"blocked-{session.name}-{blocked_generation}"
+            kind = "needs_input"
             message = (
-                "Managed Claude session failed. Inspect its authoritative logs and "
-                "verify any partial artifacts before deciding whether to retry."
-            )
-        elif state in {"stopped", "terminated"}:
-            kind = "session_ended"
-            message = (
-                "Managed Claude session stopped. Inspect its logs and verify any "
-                "produced artifacts."
+                "Managed Claude session is blocked. Inspect its authoritative state "
+                "and logs, then provide only task-scoped input."
             )
         else:
-            kind = "completed"
-            message = (
-                "Managed Claude session completed. Read its logs, inspect the "
-                "artifacts, and independently verify the work."
+            if last_state != state:
+                _write_json_atomic(
+                    observation_path,
+                    {
+                        "version": 1,
+                        "state": state,
+                        "blocked_generation": blocked_generation,
+                        "observed_at": time.time(),
+                    },
+                )
+            continue
+        if _existing_event(session, event_id) is None:
+            enqueue_event(
+                session,
+                kind=kind,
+                message=message,
+                event_id=event_id,
+                payload={"native_state": state},
             )
-        enqueue_event(
-            session,
-            kind=kind,
-            message=message,
-            event_id=event_id,
-            payload={"native_state": state},
+            signal_dispatcher(session)
+            enqueued += 1
+        _write_json_atomic(
+            observation_path,
+            {
+                "version": 1,
+                "state": state,
+                "blocked_generation": blocked_generation,
+                "observed_at": time.time(),
+            },
         )
-        signal_dispatcher(session)
-        enqueued += 1
     return enqueued
+
+
+def enqueue_native_terminal_events() -> int:
+    """Compatibility alias; terminal hints are verified by lifecycle reconciliation."""
+    return enqueue_native_state_events()
 
 
 def enqueue_event(
@@ -371,7 +655,7 @@ def list_pending_events() -> list[tuple[Path, dict[str, Any]]]:
     root = state_root()
     if not root.is_dir():
         return pending
-    for session in sorted(root.iterdir()):
+    for session in managed_session_directories():
         directory = session / "events" / "pending"
         if not directory.is_dir():
             continue
@@ -384,11 +668,18 @@ def list_pending_events() -> list[tuple[Path, dict[str, Any]]]:
     return pending
 
 
-def claim_event(session: Path, event_id: str, *, consumer: str) -> EventClaim | None:
-    """Atomically claim one pending event for exactly one delivery path."""
+def claim_event(
+    session: Path, event_id: str, *, consumer: str, source: str = "pending"
+) -> EventClaim | None:
+    """Atomically claim one spool event for exactly one delivery path.
+
+    ``source`` is ``pending`` by default, or ``undeliverable`` so the tool-wait path
+    can still hand a dead-lettered event to its own session."""
     if not _EVENT_ID.fullmatch(event_id) or not consumer:
         return None
-    source = session / "events" / "pending" / f"{event_id}.json"
+    if source not in ("pending", "undeliverable"):
+        raise ValueError("event claim source must be pending or undeliverable")
+    source = session / "events" / source / f"{event_id}.json"
     claimed_dir = session / "events" / "claimed"
     claimed_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     destination = claimed_dir / f"claim-{os.getpid()}-{uuid.uuid4().hex}.json"
@@ -409,9 +700,11 @@ def claim_event(session: Path, event_id: str, *, consumer: str) -> EventClaim | 
     )
 
 
-def claim_next_event(session: Path, *, consumer: str) -> EventClaim | None:
-    """Claim the oldest pending event from one managed session."""
-    pending_dir = session / "events" / "pending"
+def claim_next_event(
+    session: Path, *, consumer: str, source: str = "pending"
+) -> EventClaim | None:
+    """Claim the oldest event of one managed session from ``source``."""
+    pending_dir = session / "events" / source
     if not pending_dir.is_dir():
         return None
     candidates: list[tuple[float, str, Path]] = []
@@ -421,16 +714,18 @@ def claim_next_event(session: Path, *, consumer: str) -> EventClaim | None:
         order = float(created_at) if isinstance(created_at, (int, float)) else 0.0
         candidates.append((order, path.name, path))
     for _created_at, _name, path in sorted(candidates):
-        claim = claim_event(session, path.stem, consumer=consumer)
+        claim = claim_event(session, path.stem, consumer=consumer, source=source)
         if claim is not None:
             return claim
     return None
 
 
 def complete_event_claim(claim: EventClaim, *, disposition: str) -> bool:
-    """Archive a claimed event as either host-published or tool-consumed."""
-    if disposition not in {"published", "consumed"}:
-        raise ValueError("event disposition must be published or consumed")
+    """Archive a claimed event as host-published, tool-consumed, or undeliverable."""
+    if disposition not in EVENT_DISPOSITIONS:
+        raise ValueError(
+            "event disposition must be published, consumed, or undeliverable"
+        )
     destination = claim.session / "events" / disposition / f"{claim.event_id}.json"
     destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     if destination.is_file():
@@ -441,6 +736,46 @@ def complete_event_claim(claim: EventClaim, *, disposition: str) -> bool:
     except OSError:
         return False
     return True
+
+
+def _rewrite_claim(claim: EventClaim, updates: Mapping[str, Any]) -> bool:
+    """Persist ``updates`` into the claimed record across release or archival."""
+    if not claim.path.is_file():
+        return False
+    claim.event.update(updates)
+    try:
+        _write_json_atomic(claim.path, claim.event)
+    except OSError:
+        return False
+    return True
+
+
+def note_publish_failure(claim: EventClaim, error: str) -> int:
+    """Count one failed wake publish on the claimed record; return the total."""
+    attempts = claim.event.get("publish_attempts")
+    attempts = (attempts if isinstance(attempts, int) and attempts >= 0 else 0) + 1
+    _rewrite_claim(
+        claim,
+        {
+            "publish_attempts": attempts,
+            "publish_last_error": str(error)[:500],
+            "publish_last_failed_at": time.time(),
+        },
+    )
+    return attempts
+
+
+def dead_letter_event_claim(claim: EventClaim, *, reason: str) -> bool:
+    """Archive a claimed event as ``undeliverable``: the wake will never be published.
+
+    The record stays readable (the tool-wait path may still consume it for its own
+    session) and counts as settled for terminal-session retirement, so an unroutable
+    terminal event can no longer pin a finished session forever."""
+    _rewrite_claim(
+        claim,
+        {"undeliverable_reason": str(reason)[:500], "undeliverable_at": time.time()},
+    )
+    return complete_event_claim(claim, disposition="undeliverable")
 
 
 def release_event_claim(claim: EventClaim) -> bool:
@@ -489,7 +824,7 @@ def recover_abandoned_event_claims() -> int:
     root = state_root()
     if not root.is_dir():
         return 0
-    for session in sorted(path for path in root.iterdir() if path.is_dir()):
+    for session in managed_session_directories():
         claimed_dir = session / "events" / "claimed"
         if not claimed_dir.is_dir():
             continue
@@ -633,7 +968,7 @@ def _pending_paths() -> list[tuple[Path, Path]]:
     root = state_root()
     if not root.is_dir():
         return result
-    for session in sorted(root.iterdir()):
+    for session in managed_session_directories():
         requests = session / "requests"
         if not requests.is_dir():
             continue
@@ -680,7 +1015,7 @@ def decide(request_id: str, decision: str, reason: str) -> dict[str, Any]:
     root = state_root()
     if not root.is_dir():
         return {"ok": False, "error": "permission request is no longer pending"}
-    for session in sorted(root.iterdir()):
+    for session in managed_session_directories():
         request_path = session / "requests" / f"{request_id}.json"
         response_path = session / "responses" / f"{request_id}.json"
         if not request_path.is_file() or response_path.exists():
@@ -708,14 +1043,85 @@ def resolve_request(
     reason: str,
 ) -> None:
     request_id = str(request["request_id"])
-    _write_json_atomic(
-        session / "resolved" / f"{request_id}.json",
+    resolved_path = session / "resolved" / f"{request_id}.json"
+    _write_json_exclusive(
+        resolved_path,
         {
             **request,
             "decision": decision,
             "reason": reason,
             "resolved_at": time.time(),
+            "resolution_source": "permission_hook",
         },
     )
     (session / "requests" / f"{request_id}.json").unlink(missing_ok=True)
     (session / "responses" / f"{request_id}.json").unlink(missing_ok=True)
+
+
+def expire_orphaned_requests(
+    session: Path,
+    *,
+    stale_before: float,
+    resolved_at: float,
+) -> int:
+    """Atomically tombstone terminal-session requests whose hook waiter is gone."""
+    requests = session / "requests"
+    resolving = session / "resolving"
+    resolving.mkdir(parents=True, exist_ok=True, mode=0o700)
+    candidates: list[Path] = []
+    if requests.is_dir():
+        for request_path in sorted(requests.glob("*.json")):
+            request = _read_json(request_path)
+            created_at = request.get("created_at") if request is not None else None
+            if isinstance(created_at, (int, float)):
+                reference_time = float(created_at)
+            else:
+                try:
+                    reference_time = request_path.stat().st_mtime
+                except OSError:
+                    continue
+            if reference_time > stale_before:
+                continue
+            claim = resolving / request_path.name
+            if claim.exists():
+                continue
+            try:
+                os.replace(request_path, claim)
+            except OSError:
+                continue
+            candidates.append(claim)
+    candidates.extend(
+        path for path in sorted(resolving.glob("*.json")) if path not in candidates
+    )
+
+    expired = 0
+    for claim in candidates:
+        raw_request = _read_json(claim)
+        request_id = claim.stem
+        if not _REQUEST_ID.fullmatch(request_id):
+            continue
+        request = dict(raw_request or {"request_id": request_id})
+        response_path = session / "responses" / f"{request_id}.json"
+        response = _read_json(response_path) or {}
+        decision = response.get("decision")
+        reason = response.get("reason")
+        if decision not in {"allow", "deny"} or not isinstance(reason, str):
+            decision = "deny"
+            reason = _TERMINAL_REQUEST_REASON
+        resolved_path = session / "resolved" / f"{request_id}.json"
+        written = _write_json_exclusive(
+            resolved_path,
+            {
+                **request,
+                "decision": decision,
+                "reason": reason,
+                "resolved_at": resolved_at,
+                "resolution_source": "terminal_reconciliation",
+            },
+        )
+        if not written and _read_json(resolved_path) is None:
+            continue
+        claim.unlink(missing_ok=True)
+        response_path.unlink(missing_ok=True)
+        expired += 1
+    return expired

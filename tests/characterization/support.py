@@ -39,7 +39,7 @@ REQUIRED_FLAGS = (
     "--effort",
 )
 REQUIRED_COMMANDS = ("attach", "logs", "stop", "respawn", "rm", "agents")
-REQUIRED_AGENT_OBJECT_KEYS = frozenset(("id", "name", "state"))
+REQUIRED_AGENT_OBJECT_KEYS = frozenset(("id", "name", "state", "cwd", "startedAt"))
 SAFE_COMMANDS: tuple[tuple[str, ...], ...] = (
     ("--version",),
     ("--help",),
@@ -322,6 +322,10 @@ def _run_command(
     )
     hard_deadline = started_at + total_allowance
     try:
+        # Characterization runs launch the real claude binary in throwaway
+        # repos. Keep those runs out of the user's Honcho memory: the plugin
+        # honors HONCHO_ENABLED=false as a runtime override.
+        environment = {**os.environ, "HONCHO_ENABLED": "false"}
         process = subprocess.Popen(
             normalized_argv,
             shell=False,
@@ -329,6 +333,7 @@ def _run_command(
             stderr=subprocess.PIPE,
             start_new_session=os.name == "posix",
             cwd=cwd,
+            env=environment,
         )
     except OSError as error:
         return CommandCapture(
@@ -779,6 +784,39 @@ def _owned_rows(rows: object, owned: _OwnedProbe) -> list[Mapping[str, Any]]:
     return matches
 
 
+def _strict_owned_candidates(
+    rows: object, owned: _OwnedProbe
+) -> list[Mapping[str, Any]] | None:
+    """Match one reconciled identity and reject malformed short-ID collisions."""
+    if (
+        not isinstance(rows, list)
+        or owned.display_id is None
+        or owned.session_id is None
+    ):
+        return None
+    matches: list[Mapping[str, Any]] = []
+    for item in rows:
+        if not isinstance(item, Mapping):
+            continue
+        full = item.get("sessionId")
+        candidate = item.get("id") == owned.display_id or full == owned.session_id
+        if not candidate:
+            continue
+        try:
+            canonical = isinstance(full, str) and str(uuid.UUID(full)) == full
+        except ValueError:
+            canonical = False
+        if not (
+            canonical
+            and item.get("id") == owned.display_id
+            and full == owned.session_id
+            and item.get("name") == owned.display_name
+        ):
+            return None
+        matches.append(item)
+    return matches
+
+
 def _owned_row(rows: object, owned: _OwnedProbe) -> Mapping[str, Any] | None:
     matches = _owned_rows(rows, owned)
     return matches[0] if len(matches) == 1 else None
@@ -800,7 +838,11 @@ def _run_owned_observer_command(
         raise CharacterizationError("observer command must use the validated binary")
     suffix = argv[1:]
     is_listing = suffix == ("agents", "--json", "--all")
-    is_stop = owned.display_id is not None and suffix == ("stop", owned.display_id)
+    is_stop_or_remove = (
+        owned.display_id is not None
+        and suffix[0:1] in {("stop",), ("rm",)}
+        and suffix[1:] == (owned.display_id,)
+    )
     expected_mode = "manual"
     is_launch = (
         len(suffix) == 8
@@ -809,7 +851,7 @@ def _run_owned_observer_command(
         and suffix[5] == "--plugin-dir"
         and suffix[7] == _probe_prompt(owned.matcher)
     )
-    if not (is_listing or is_stop or is_launch):
+    if not (is_listing or is_stop_or_remove or is_launch):
         raise CharacterizationError("observer command shape is not probe-owned")
     return _run_command_within_total_budget(
         argv, total_timeout_seconds=timeout, cwd=cwd
@@ -933,37 +975,77 @@ def _discover_native_identity(
 def _cleanup_owned(
     binary: Path, owned: _OwnedProbe, cwd: Path, deadline: float
 ) -> tuple[bool, CommandCapture | None, CommandCapture | None]:
-    """Stop only a read-back exact UUID and accept absence or terminal state."""
-    if _remaining(deadline) <= 0:
+    """Fence short-token cleanup with an exact full-identity roster read."""
+    if owned.display_id is None or _remaining(deadline) <= 0:
         return False, None, None
+    latest: CommandCapture | None = None
+    if owned.session_id is not None:
+        latest = _listing(
+            binary, owned, cwd, min(OBSERVER_TIMEOUT_SECONDS, _remaining(deadline))
+        )
+        if latest.returncode != 0 or latest.timed_out:
+            return False, None, latest
+        try:
+            preflight = _strict_owned_candidates(json.loads(latest.stdout), owned)
+        except json.JSONDecodeError:
+            return False, None, latest
+        if preflight is None or len(preflight) > 1:
+            return False, None, latest
+        if not preflight:
+            return True, None, latest
     stop = _run_owned_observer_command(
         binary,
         owned,
-        (str(binary), "stop", cast(str, owned.display_id)),
+        (str(binary), "stop", owned.display_id),
         cwd,
         min(OBSERVER_TIMEOUT_SECONDS, _remaining(deadline)),
     )
-    latest: CommandCapture | None = None
     while _remaining(deadline) > 0:
         latest = _listing(
             binary, owned, cwd, min(OBSERVER_TIMEOUT_SECONDS, _remaining(deadline))
         )
         if latest.returncode == 0 and not latest.timed_out:
             try:
-                matches = _owned_rows(json.loads(latest.stdout), owned)
+                payload = json.loads(latest.stdout)
+                matches = (
+                    _strict_owned_candidates(payload, owned)
+                    if owned.session_id is not None
+                    else _owned_rows(payload, owned)
+                )
             except json.JSONDecodeError:
                 matches = None
-            absent = matches is not None and len(matches) == 0
-            terminal = (
-                matches is not None
-                and len(matches) == 1
-                and (
-                    isinstance(matches[0].get("state"), str)
-                    and matches[0]["state"] in _TERMINAL_STATES
-                )
-            )
-            if absent or terminal:
+            if matches is None or len(matches) > 1:
+                return False, stop, latest
+            if not matches:
                 return stop.returncode == 0 and not stop.timed_out, stop, latest
+            state = matches[0].get("state")
+            if isinstance(state, str) and state in _TERMINAL_STATES:
+                if owned.session_id is None:
+                    return False, stop, latest
+                removed = _run_owned_observer_command(
+                    binary,
+                    owned,
+                    (str(binary), "rm", owned.display_id),
+                    cwd,
+                    min(OBSERVER_TIMEOUT_SECONDS, _remaining(deadline)),
+                )
+                if removed.returncode != 0 or removed.timed_out:
+                    return False, stop, latest
+                latest = _listing(
+                    binary,
+                    owned,
+                    cwd,
+                    min(OBSERVER_TIMEOUT_SECONDS, _remaining(deadline)),
+                )
+                if latest.returncode != 0 or latest.timed_out:
+                    return False, stop, latest
+                try:
+                    remaining = _strict_owned_candidates(
+                        json.loads(latest.stdout), owned
+                    )
+                except json.JSONDecodeError:
+                    return False, stop, latest
+                return remaining == [], stop, latest
         time.sleep(min(0.2, _remaining(deadline)))
     return False, stop, latest
 
@@ -1288,13 +1370,17 @@ def _run_owned_worktree_command(
     cwd: Path,
     timeout: float,
 ) -> CommandCapture:
-    """Allow only the one owned launch, exact listing, and exact-token stop."""
+    """Allow only one owned launch, listing, or exact-identity mutation."""
     if not argv or argv[0] != str(binary):
         raise CharacterizationError("worktree command must use the validated binary")
     suffix = argv[1:]
     allowed = (
         suffix == ("agents", "--json", "--all")
-        or (probe.display_id is not None and suffix == ("stop", probe.display_id))
+        or (
+            probe.display_id is not None
+            and suffix[0:1] in {("stop",), ("rm",)}
+            and suffix[1:] == (probe.display_id,)
+        )
         or suffix == _worktree_launch_argv(binary, probe, Path("<plugin>"))[1:-2]
     )
     # The plugin path is deliberately dynamic; compare fixed launch fields separately.
@@ -1494,6 +1580,32 @@ def _worktree_cleanup(
 ) -> bool:
     if probe.display_id is None or _remaining(deadline) <= 0:
         return False
+    owned = _OwnedProbe(
+        probe.display_name,
+        "worktree",
+        probe.session_id,
+        probe.display_id,
+    )
+    if probe.session_id is not None:
+        preflight = _run_owned_worktree_command(
+            binary,
+            probe,
+            (str(binary), "agents", "--json", "--all"),
+            repository,
+            min(WORKTREE_TIMEOUT_SECONDS, _remaining(deadline)),
+        )
+        if preflight.returncode != 0 or preflight.timed_out:
+            return False
+        try:
+            preflight_matches = _strict_owned_candidates(
+                json.loads(preflight.stdout), owned
+            )
+        except json.JSONDecodeError:
+            return False
+        if preflight_matches is None or len(preflight_matches) > 1:
+            return False
+        if not preflight_matches:
+            return True
     stop = _run_owned_worktree_command(
         binary,
         probe,
@@ -1513,25 +1625,79 @@ def _worktree_cleanup(
         )
         if listing.returncode == 0 and not listing.timed_out:
             try:
-                matches = _owned_rows(
-                    json.loads(listing.stdout),
-                    _OwnedProbe(
-                        probe.display_name,
-                        "worktree",
-                        probe.session_id,
-                        probe.display_id,
-                    ),
+                payload = json.loads(listing.stdout)
+                matches = (
+                    _strict_owned_candidates(payload, owned)
+                    if probe.session_id is not None
+                    else _owned_rows(payload, owned)
                 )
             except json.JSONDecodeError:
                 return False
-            if len(matches) == 0:
-                return True
-            if len(matches) == 1 and matches[0].get("state") in _TERMINAL_STATES:
-                return True
-            if len(matches) > 1:
+            if matches is None or len(matches) > 1:
                 return False
+            if not matches or matches[0].get("state") in _TERMINAL_STATES:
+                return True
         time.sleep(min(0.2, _remaining(deadline)))
     return False
+
+
+def _retire_owned_worktree_record(
+    binary: Path, probe: _WorktreeProbe, repository: Path, deadline: float
+) -> bool:
+    """Remove one exact terminal probe record after worktree evidence is captured."""
+    if (
+        probe.display_id is None
+        or probe.session_id is None
+        or _remaining(deadline) <= 0
+    ):
+        return False
+    owned = _OwnedProbe(
+        probe.display_name,
+        "worktree",
+        probe.session_id,
+        probe.display_id,
+    )
+    listing = _run_owned_worktree_command(
+        binary,
+        probe,
+        (str(binary), "agents", "--json", "--all"),
+        repository,
+        min(WORKTREE_TIMEOUT_SECONDS, _remaining(deadline)),
+    )
+    if listing.returncode != 0 or listing.timed_out:
+        return False
+    try:
+        matches = _strict_owned_candidates(json.loads(listing.stdout), owned)
+    except json.JSONDecodeError:
+        return False
+    if matches is None or len(matches) > 1:
+        return False
+    if not matches:
+        return True
+    if matches[0].get("state") not in _TERMINAL_STATES:
+        return False
+    removed = _run_owned_worktree_command(
+        binary,
+        probe,
+        (str(binary), "rm", probe.display_id),
+        repository,
+        min(WORKTREE_TIMEOUT_SECONDS, _remaining(deadline)),
+    )
+    if removed.returncode != 0 or removed.timed_out:
+        return False
+    listing = _run_owned_worktree_command(
+        binary,
+        probe,
+        (str(binary), "agents", "--json", "--all"),
+        repository,
+        min(WORKTREE_TIMEOUT_SECONDS, _remaining(deadline)),
+    )
+    if listing.returncode != 0 or listing.timed_out:
+        return False
+    try:
+        return _strict_owned_candidates(json.loads(listing.stdout), owned) == []
+    except json.JSONDecodeError:
+        return False
 
 
 def _evidence_cwds(evidence_directory: Path) -> set[str]:
@@ -1803,7 +1969,7 @@ def collect_disposable_worktree_edit_characterization(
         except Exception as caught:
             archive_error = caught
         finally:
-            cleanup_confirmed = _worktree_cleanup(
+            stop_confirmed = _worktree_cleanup(
                 binary,
                 probe,
                 repository,
@@ -1814,7 +1980,7 @@ def collect_disposable_worktree_edit_characterization(
         stop_preserved_artifact: bool | None = None
         stop_preserved_worktree: bool | None = None
         primary_unchanged_after_stop: bool | None = None
-        if cleanup_confirmed:
+        if stop_confirmed:
             try:
                 post_stop_worktrees = _worktree_paths(
                     _worktree_snapshot(repository, deadline)
@@ -1840,6 +2006,12 @@ def collect_disposable_worktree_edit_characterization(
             except Exception as caught:
                 if error is None:
                     error = caught
+        cleanup_confirmed = stop_confirmed and _retire_owned_worktree_record(
+            binary,
+            probe,
+            repository,
+            min(deadline, time.monotonic() + WORKTREE_CLEANUP_SECONDS),
+        )
         after_agents = _snapshot_agents(
             _run_owned_worktree_command(
                 binary,
@@ -1960,7 +2132,7 @@ def _run_owned_lifecycle_command(
         ("daemon", "status"),
         _lifecycle_launch_argv(binary, probe)[1:],
     }
-    if len(suffix) == 2 and suffix[0] in {"logs", "stop", "respawn"}:
+    if len(suffix) == 2 and suffix[0] in {"logs", "stop", "respawn", "rm"}:
         allowed = suffix[1] in identifiers
     if not allowed:
         raise CharacterizationError("lifecycle command shape is not probe-owned")
@@ -2215,12 +2387,9 @@ def _lifecycle_operation(
 def _lifecycle_cleanup(
     binary: Path, probe: _LifecycleProbe, cwd: Path, deadline: float
 ) -> bool:
-    if (
-        probe.display_id is None
-        or _lifecycle_operation(binary, probe, "stop", probe.display_id, cwd, deadline)
-        != "accepted"
-    ):
+    if probe.display_id is None or probe.session_id is None:
         return False
+    stop_attempted = False
     while _remaining(deadline) > 0:
         capture = _lifecycle_listing(
             binary, probe, cwd, min(LIFECYCLE_TIMEOUT_SECONDS, _remaining(deadline))
@@ -2233,12 +2402,41 @@ def _lifecycle_cleanup(
             matches = _strict_lifecycle_owned_candidates(rows, probe)
             if matches is None:
                 return False
-            if not matches or (
-                len(matches) == 1 and matches[0].get("state") in _TERMINAL_STATES
-            ):
+            if not matches:
                 return True
-            if len(matches) > 1:
+            if len(matches) != 1:
                 return False
+            if matches[0].get("state") in _TERMINAL_STATES:
+                removed = _run_owned_lifecycle_command(
+                    binary,
+                    probe,
+                    (str(binary), "rm", probe.display_id),
+                    cwd,
+                    min(LIFECYCLE_TIMEOUT_SECONDS, _remaining(deadline)),
+                )
+                if removed.returncode != 0 or removed.timed_out:
+                    return False
+                capture = _lifecycle_listing(
+                    binary,
+                    probe,
+                    cwd,
+                    min(LIFECYCLE_TIMEOUT_SECONDS, _remaining(deadline)),
+                )
+                if capture.returncode != 0 or capture.timed_out:
+                    return False
+                try:
+                    remaining = json.loads(capture.stdout)
+                except json.JSONDecodeError:
+                    return False
+                exact = _strict_lifecycle_owned_candidates(remaining, probe)
+                return exact == []
+            if not stop_attempted:
+                stopped = _lifecycle_operation(
+                    binary, probe, "stop", probe.display_id, cwd, deadline
+                )
+                if stopped != "accepted":
+                    return False
+                stop_attempted = True
         time.sleep(min(LIFECYCLE_POLL_SECONDS, _remaining(deadline)))
     return False
 
@@ -2246,37 +2444,8 @@ def _lifecycle_cleanup(
 def _strict_lifecycle_owned_candidates(
     rows: object, probe: _LifecycleProbe
 ) -> list[Mapping[str, Any]] | None:
-    """Return exact owned rows, distinguishing absence from malformed ownership."""
-    if not isinstance(rows, list) or probe.display_id is None:
-        return None
-    matches: list[Mapping[str, Any]] = []
-    for item in rows:
-        if not isinstance(item, Mapping):
-            continue
-        full = item.get("sessionId")
-        candidate = (
-            item.get("name") == probe.display_name
-            or item.get("id") == probe.display_id
-            or (probe.session_id is not None and full == probe.session_id)
-        )
-        if not candidate:
-            continue
-        try:
-            canonical = isinstance(full, str) and str(uuid.UUID(full)) == full
-        except ValueError:
-            canonical = False
-        exact = (
-            canonical
-            and item.get("name") == probe.display_name
-            and item.get("id") == probe.display_id
-            and isinstance(full, str)
-            and full[:8] == probe.display_id
-            and (probe.session_id is None or full == probe.session_id)
-        )
-        if not exact:
-            return None
-        matches.append(item)
-    return matches
+    """Return exact UUID/short-ID matches, distinguishing absence from malformed."""
+    return _strict_owned_candidates(rows, _lifecycle_owned(probe))
 
 
 def collect_unattended_lifecycle_characterization(
@@ -2368,7 +2537,9 @@ def collect_unattended_lifecycle_characterization(
             if reconciled is None:
                 raise CharacterizationError("lifecycle identity read-back failed")
             probe = reconciled
-            cleanup_probes[token] = probe
+            assert probe.display_id is not None and probe.session_id is not None
+            cleanup_probes.pop(token, None)
+            cleanup_probes[probe.session_id] = probe
             identity_reconciled = True
             daemon["after_launch"] = _daemon_snapshot(
                 binary, probe, repository, work_deadline
@@ -2441,6 +2612,9 @@ def collect_unattended_lifecycle_characterization(
                         else "replaced"
                     )
                     probe = respawned
+                    assert probe.display_id is not None and probe.session_id is not None
+                    cleanup_probes.pop(probe.display_id, None)
+                    cleanup_probes[probe.session_id] = probe
                 else:
                     acceptance["respawn"]["short"] = "probe_inconclusive"
                     raise CharacterizationError(
@@ -2494,6 +2668,9 @@ def collect_unattended_lifecycle_characterization(
                 )
                 if respawned is not None:
                     probe = respawned
+                    assert probe.display_id is not None and probe.session_id is not None
+                    cleanup_probes.pop(probe.display_id, None)
+                    cleanup_probes[probe.session_id] = probe
                 else:
                     acceptance["respawn"]["full_uuid"] = "probe_inconclusive"
                     raise CharacterizationError(
@@ -2535,15 +2712,18 @@ def collect_unattended_lifecycle_characterization(
                 cleanup_deadline = min(
                     deadline, time.monotonic() + LIFECYCLE_CLEANUP_SECONDS
                 )
-                cleanup_confirmed = _lifecycle_cleanup(
-                    binary, probe, repository, cleanup_deadline
-                )
+                cleanup_targets = {
+                    cleanup_probe.session_id: cleanup_probe
+                    for cleanup_probe in cleanup_probes.values()
+                    if cleanup_probe.session_id is not None
+                }
                 for cleanup_probe in cleanup_probes.values():
-                    if cleanup_probe.display_id == probe.display_id:
+                    if (
+                        cleanup_probe.session_id is not None
+                        or cleanup_probe.display_id is None
+                        or _remaining(cleanup_deadline) <= 0
+                    ):
                         continue
-                    if _remaining(cleanup_deadline) <= 0:
-                        break
-                    assert cleanup_probe.display_id is not None
                     _run_owned_lifecycle_command(
                         binary,
                         cleanup_probe,
@@ -2554,6 +2734,20 @@ def collect_unattended_lifecycle_characterization(
                             _remaining(cleanup_deadline),
                         ),
                     )
+                cleanup_confirmed = (
+                    probe.session_id is not None and probe.session_id in cleanup_targets
+                )
+                for cleanup_probe in cleanup_targets.values():
+                    if _remaining(cleanup_deadline) <= 0:
+                        cleanup_confirmed = False
+                        break
+                    target_confirmed = _lifecycle_cleanup(
+                        binary,
+                        cleanup_probe,
+                        repository,
+                        cleanup_deadline,
+                    )
+                    cleanup_confirmed = target_confirmed and cleanup_confirmed
             daemon["after_final_stop"] = _daemon_snapshot(
                 binary, probe, repository, deadline
             )

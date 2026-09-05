@@ -15,7 +15,7 @@
     ],
     "Notification": [
       {
-        "matcher": "agent_needs_input|agent_completed",
+        "matcher": "permission_prompt|idle_prompt|agent_needs_input|agent_completed",
         "hooks": [
           {
             "type": "command",

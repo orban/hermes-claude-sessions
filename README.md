@@ -35,8 +35,12 @@ Polling the roster remains a recovery fallback, not an agent loop.
 
 ## Model tools
 
-- `claude_session_start` — launches one native Claude `--bg` session. Default `permission_mode` is `auto`.
-- `claude_session_list` — reads the authoritative native roster.
+- `claude_session_start` — launches one native Claude `--bg` session. Default
+  `permission_mode` is `auto`. Each launch receives an adapter-generated unique
+  native display name; Claude background mode does not accept caller-selected
+  session IDs.
+- `claude_session_list` — reads the authoritative native roster; optional `id`
+  filters to one exact short ID and optional `limit` bounds the returned rows.
 - `claude_permission_list` — lists pending requests waiting for Hermes judgment.
 - `claude_permission_decide` — allows or denies one exact request once. It never installs a persistent allow rule.
 - `claude_session_wait` — performs one bounded blocking wait for a semantic event. Its atomic claim prevents duplicate fresh-turn delivery.
@@ -55,14 +59,74 @@ Use `fable`/`low` for bounded reconnaissance, `sonnet`/`high` for normal impleme
 
 ## Managed permission flow
 
-1. Hermes launches Claude in `auto` mode with the selected model and effort plus a session-scoped hook plugin.
+1. Every managed launch receives session-scoped lifecycle hooks. `auto` mode also receives the blocking permission hook; other modes receive event-only hooks.
 2. Claude's classifier handles routine actions.
 3. If Claude emits `PermissionRequest`, the hook writes both a bounded JSON request and a durable semantic wake event below `$HERMES_HOME/state/claude-sessions/managed/`, signals the managing Hermes process, and blocks.
 4. The wake event re-enters the originating Hermes session. Hermes calls `claude_permission_list`, evaluates the exact tool and input against the delegated task and working directory, then calls `claude_permission_decide`.
 5. The hook returns Claude's documented one-shot `allow` or `deny` decision and records a resolved audit artifact.
 6. Missing state, malformed input, invalid decisions, and timeouts deny closed.
+   If the hook process disappears while a terminal session still has a pending
+   request, terminal reconciliation denies and tombstones that request after a
+   bounded grace period so retirement cannot remain blocked forever.
 
 Hermes should allow only actions needed by the user's task. It should deny credential access, authentication changes, permission changes, destructive operations, unrelated process control, uploads, publication, payment, and writes outside the delegated workspace unless the user explicitly authorized that exact effect.
+
+## Terminal lifecycle
+
+### Knowing whether a wake can reach you
+
+`claude_session_start` reports `wake: "routable"` when the launching turn carries a
+session identity the host can re-enter (gateway chat sessions), and `wake: "none"`
+with a `wake_hint` when it does not (interactive CLI, `hermes chat -q`, cron, kanban
+workers). With `none`, the agent must `claude_session_wait` before ending the turn;
+otherwise the completion is only ever visible through `claude_session_list`.
+
+### Undeliverable events
+
+An event whose route carries no session identity (a session launched from the CLI, a
+kanban worker, or before the host exposed `capture_background_event_route`) can never be
+published as a wake. The dispatcher moves it to `events/undeliverable/` on the first
+drain instead of retrying forever, and a publish that keeps failing is dead-lettered
+after `MAX_PUBLISH_ATTEMPTS` (5). A dead-lettered record still reaches
+`claude_session_wait` for its own session, and it counts as settled for terminal
+retirement, so an unroutable outcome no longer pins a finished session in place.
+
+Claude's per-job `state.json` is the sole terminal authority. Hooks only persist
+attention events or signal the adapter to reconcile that native state; they do
+not declare completion themselves.
+
+Terminal retirement is a replayable state machine:
+
+1. persist the stable terminal wake event and wait until Hermes has durably
+   published or consumed it;
+2. capture bounded logs to a mode-`0600` snapshot;
+3. call Claude's supported `rm` command without force;
+4. record either `retired` or a retryable `retirement_blocked` state;
+5. serve archived logs after native retirement; and
+6. compact the adapter tombstone after seven days only when the terminal event
+   is durably `published` or `consumed`.
+
+An explicit `claude_session_stop` captures bounded logs before asking Claude to
+stop the native job. This preserves authorized log readback even when Claude
+removes the job immediately after acknowledging the stop.
+
+Claude refuses retirement when a worktree contains uncommitted or unpushed
+work. The adapter preserves that session and retries with exponential backoff,
+capped at 24 hours; it never deletes the protected worktree itself. If an
+adapter-owned native job disappears from both the roster and its state path,
+the adapter waits through a bounded grace period and then persists a synthetic
+`missing` terminal observation before applying the same durable-event gate.
+
+Launch failures are fenced separately. Timeout, malformed output, and other
+uncertain outcomes retain their intent record for bounded roster reconciliation
+using the unique launch name, canonical working directory, launch time, and the
+native short-ID/full-session-ID relationship. The adapter never guesses between
+multiple candidates.
+
+Only sessions launched by this lifecycle-aware adapter (`launch_state=bound`)
+are retired automatically. Legacy managed records remain observable but require
+explicit cleanup. Bounded native `rm` diagnostics are retained in mode-`0600`
+lifecycle state and are never copied into wake-event payloads.
 
 ## Security boundary
 

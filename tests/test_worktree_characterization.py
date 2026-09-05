@@ -62,6 +62,9 @@ def _runner(
         if argv[1] == "stop":
             rows[native_session_id]["state"] = "stopped"
             return CommandCapture(argv, 0, "", "", False, None)
+        if argv[1] == "rm":
+            rows.pop(native_session_id)
+            return CommandCapture(argv, 0, "", "", False, None)
         if argv[1:3] == ("agents", "--json"):
             items = list(rows.values())
             if duplicate and native_session_id in rows:
@@ -355,7 +358,7 @@ def test_cleanup_accepts_done_after_successful_stop(
     assert _worktree_cleanup(
         Path(EXACT_CLAUDE_BIN), probe, tmp_path, time.monotonic() + 1
     )
-    assert [call[1] for call in calls] == ["stop", "agents"]
+    assert [call[1] for call in calls] == ["agents", "stop", "agents"]
 
 
 def test_identity_finally_cleanup_sanitization_and_unrelated_preservation(
@@ -695,7 +698,14 @@ def test_finally_stops_exact_token_after_timeout_or_observation_error(
             object(), tmp_path / "failure.json"
         )
     stops = [call for call in calls if call[1] == "stop"]
-    assert len(stops) == 1 and len(stops[0][2]) == 8
+    removals = [call for call in calls if call[1] == "rm"]
+    assert len(stops) == 1
+    if fault == "identity":
+        assert len(stops[0][2]) == 8
+        assert removals == []
+    else:
+        assert len(stops[0][2]) == 8
+        assert [call[2] for call in removals] == [stops[0][2]]
 
 
 def test_no_token_and_duplicate_identity_fail_without_broad_mutation(

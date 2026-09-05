@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from . import bridge, events
+from . import bridge, events, lifecycle
 from .safety import without_prompt
 
 ALLOWED_PERMISSION_MODES = ("auto", "manual", "acceptEdits", "plan")
@@ -24,11 +24,18 @@ COMMAND_TIMEOUT_SECONDS = 20
 DEFAULT_WAIT_SECONDS = 600.0
 MAX_WAIT_SECONDS = 600.0
 MAX_OUTPUT_CHARS = 8_192
+DEFAULT_SESSION_LIST_LIMIT = 20
+MAX_SESSION_LIST_LIMIT = 100
 LOG_STDOUT_CHARS = 5_500
 LOG_STDERR_CHARS = 1_000
+MAX_PERMISSION_TOOL_INPUT_CHARS = 1_500
+MAX_PERMISSION_FIELD_CHARS = 128
 _TRUNCATION_MARKER = "\n[truncated]"
 _LEADING_TRUNCATION_MARKER = "[truncated]\n"
-_LAUNCH_ID = re.compile(r"backgrounded\s+·\s+([0-9a-f]{8})\s+·")
+_LAUNCH_LINE = re.compile(
+    r"^backgrounded\s+·\s+([0-9a-f]{8})\s+·\s+([^\r\n]+?)\s*$",
+    re.MULTILINE,
+)
 _NATIVE_ID = re.compile(r"^[0-9a-f]{8}$")
 _CLAUDE_PLUGIN_DIR = Path(__file__).resolve().parent / "claude_plugin"
 
@@ -184,6 +191,15 @@ def _list_error(message: str, **details: Any) -> str:
     return _error(message, **compact)
 
 
+def _parse_launch_id(stdout: str | None, launch_name: str) -> str | None:
+    matches = [
+        match.group(1)
+        for match in _LAUNCH_LINE.finditer(stdout or "")
+        if match.group(2) == launch_name
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
 def _parse_start_args(args: object) -> StartOptions | str:
     if not isinstance(args, Mapping):
         return _error("arguments must be an object")
@@ -278,13 +294,25 @@ def _claude_session_start(args: object, *, route: dict[str, Any] | None = None) 
             stderr="",
         )
 
-    managed_session: Path | None = None
+    managed_session = bridge.create_session(
+        parsed.name,
+        parsed.cwd,
+        model=parsed.model,
+        effort=parsed.effort,
+        route=route,
+        event_socket=events.socket_path(),
+    )
+    metadata = bridge._read_json(managed_session / "metadata.json")
+    launch_name = str(metadata.get("launch_name")) if metadata is not None else ""
+    if not launch_name:
+        bridge.remove_session(managed_session)
+        return _error("Claude managed launch name could not be created", **details)
     environment: dict[str, str] | None = None
     argv = [
         claude_bin,
         "--bg",
         "--name",
-        parsed.name,
+        launch_name,
         "--permission-mode",
         parsed.permission_mode,
     ]
@@ -293,22 +321,15 @@ def _claude_session_start(args: object, *, route: dict[str, Any] | None = None) 
     if parsed.effort is not None:
         argv.extend(["--effort", parsed.effort])
     if parsed.permission_mode == "auto":
-        managed_session = bridge.create_session(
-            parsed.name,
-            parsed.cwd,
-            model=parsed.model,
-            effort=parsed.effort,
-            route=route,
-            event_socket=events.socket_path(),
-        )
         environment = os.environ.copy()
         environment[bridge.SESSION_DIR_ENV] = str(managed_session)
-        session_plugin = bridge.create_hook_plugin(
-            managed_session,
-            _CLAUDE_PLUGIN_DIR,
-            python_executable=sys.executable,
-        )
-        argv.extend(["--plugin-dir", str(session_plugin)])
+    session_plugin = bridge.create_hook_plugin(
+        managed_session,
+        _CLAUDE_PLUGIN_DIR,
+        python_executable=sys.executable,
+        include_permission_hook=parsed.permission_mode == "auto",
+    )
+    argv.extend(["--plugin-dir", str(session_plugin)])
     argv.extend(["--", parsed.prompt])
 
     run_kwargs: dict[str, Any] = {
@@ -324,11 +345,12 @@ def _claude_session_start(args: object, *, route: dict[str, Any] | None = None) 
     try:
         completed = subprocess.run(argv, **run_kwargs)
     except subprocess.TimeoutExpired:
-        if managed_session is not None:
-            bridge.remove_session(managed_session)
+        lifecycle.mark_launch_uncertain(managed_session, "launch command timed out")
         return _error(
             "Claude command timed out after 20 seconds",
             **details,
+            launch_state="uncertain",
+            managed_session=True,
             stdout="",
             stderr="",
         )
@@ -347,32 +369,73 @@ def _claude_session_start(args: object, *, route: dict[str, Any] | None = None) 
         "stderr": _bounded_output(completed.stderr, parsed.prompt),
     }
     if completed.returncode != 0:
-        if managed_session is not None:
-            bridge.remove_session(managed_session)
+        lifecycle.mark_launch_uncertain(
+            managed_session,
+            "launch command exited with a non-zero status",
+            returncode=completed.returncode,
+        )
+        payload["launch_state"] = "uncertain"
+        payload["managed_session"] = True
         payload["error"] = "Claude command exited with a non-zero status"
         return _json(payload)
 
     if managed_session is not None:
-        match = _LAUNCH_ID.search(completed.stdout or "")
-        if match is None:
-            bridge.remove_session(managed_session)
+        native_id = _parse_launch_id(completed.stdout, launch_name)
+        if native_id is None:
+            lifecycle.mark_launch_uncertain(
+                managed_session,
+                "launch output did not contain a native session id",
+                returncode=completed.returncode,
+            )
             return _error(
                 "Claude managed launch returned no reconcilable session id",
                 **details,
                 returncode=completed.returncode,
+                launch_state="uncertain",
+                managed_session=True,
                 stdout=payload["stdout"],
                 stderr=payload["stderr"],
             )
-        native_id = match.group(1)
-        bridge.set_native_id(
-            managed_session,
-            native_id,
-            native_state_path=bridge.native_job_state_path(native_id, environment),
-        )
+        try:
+            bridge.set_native_id(
+                managed_session,
+                native_id,
+                native_state_path=bridge.native_job_state_path(native_id, environment),
+            )
+        except ValueError:
+            lifecycle.mark_launch_uncertain(
+                managed_session,
+                "native session id binding could not be established",
+            )
+            return _error(
+                "Claude managed launch could not establish exclusive ownership",
+                **details,
+                returncode=completed.returncode,
+                launch_state="uncertain",
+                managed_session=True,
+                stdout=payload["stdout"],
+                stderr=payload["stderr"],
+            )
         events.watch_session(managed_session)
         payload["id"] = native_id
-        payload["managed_permissions"] = True
+        payload["managed_session"] = True
+        payload["managed_permissions"] = parsed.permission_mode == "auto"
+        payload.update(_wake_fields(route))
     return _json(payload)
+
+
+WAKE_NONE_HINT = (
+    "This turn has no return address (CLI, cron, or kanban worker), so Hermes "
+    "cannot be woken when the session finishes. Call claude_session_wait before "
+    "ending the turn, or the outcome will only be visible via claude_session_list."
+)
+
+
+def _wake_fields(route: dict[str, Any] | None) -> dict[str, Any]:
+    """Tell the caller whether a completion can re-enter this turn's session."""
+    if bridge.route_is_deliverable(route):
+        return {"wake": "routable"}
+    return {"wake": "none", "wake_hint": WAKE_NONE_HINT}
 
 
 def _run_claude(argv: list[str]) -> subprocess.CompletedProcess[str] | str:
@@ -391,6 +454,25 @@ def _run_claude(argv: list[str]) -> subprocess.CompletedProcess[str] | str:
         return _error("Claude command could not be started", stdout="", stderr="")
 
 
+def _parse_list_args(args: object) -> tuple[str | None, int] | str:
+    if not isinstance(args, Mapping):
+        return _error("arguments must be an object")
+    unknown = sorted(set(args) - {"id", "limit"})
+    if unknown:
+        return _error("unknown argument(s): " + ", ".join(unknown))
+    native_id = args.get("id")
+    if native_id is not None and (
+        not isinstance(native_id, str) or not _NATIVE_ID.fullmatch(native_id)
+    ):
+        return _error("id must be eight lowercase hexadecimal characters")
+    limit = args.get("limit", DEFAULT_SESSION_LIST_LIMIT)
+    if isinstance(limit, bool) or not isinstance(limit, int):
+        return _error("limit must be an integer")
+    if limit < 1 or limit > MAX_SESSION_LIST_LIMIT:
+        return _error(f"limit must be between 1 and {MAX_SESSION_LIST_LIMIT}")
+    return native_id, limit
+
+
 def _native_sessions(claude_bin: str) -> list[dict[str, Any]] | str:
     completed = _run_claude([claude_bin, "agents", "--json", "--all"])
     if isinstance(completed, str):
@@ -404,8 +486,6 @@ def _native_sessions(claude_bin: str) -> list[dict[str, Any]] | str:
             stdout=stdout,
             stderr=stderr,
         )
-    if len(completed.stdout) > MAX_OUTPUT_CHARS:
-        return _error("Claude session list is too large to return safely")
     try:
         sessions = json.loads(completed.stdout)
     except (TypeError, json.JSONDecodeError):
@@ -424,9 +504,13 @@ def _native_sessions(claude_bin: str) -> list[dict[str, Any]] | str:
 
 
 def claude_session_list(args: object, **kwargs: object) -> str:
-    """Return the native Claude CLI's unmodified session rows."""
-    del args, kwargs
+    """Return bounded native Claude session rows, optionally filtered by exact ID."""
+    del kwargs
     try:
+        parsed = _parse_list_args(args)
+        if isinstance(parsed, str):
+            return parsed
+        native_id, limit = parsed
         claude_bin = resolve_claude_bin()
         if claude_bin is None:
             return _list_error(
@@ -438,8 +522,20 @@ def claude_session_list(args: object, **kwargs: object) -> str:
         sessions = _native_sessions(claude_bin)
         if isinstance(sessions, str):
             return sessions
+        if native_id is not None:
+            sessions = [
+                session for session in sessions if session.get("id") == native_id
+            ]
+        total = len(sessions)
+        selected = sessions[:limit]
         return _bounded_json(
-            {"ok": True, "sessions": sessions},
+            {
+                "ok": True,
+                "sessions": selected,
+                "total": total,
+                "returned": len(selected),
+                "has_more": total > len(selected),
+            },
             "Claude session list is too large to return safely",
         )
     except Exception:
@@ -450,12 +546,66 @@ def claude_permission_list(args: object, **kwargs: object) -> str:
     """List pending Claude permission requests awaiting Hermes judgment."""
     del args, kwargs
     try:
-        return _bounded_json(
-            {"ok": True, "requests": bridge.list_pending()},
-            "Claude permission requests are too large to return safely",
-        )
+        requests = bridge.list_pending()
+        summaries: list[dict[str, Any]] = []
+        details: list[dict[str, Any]] = []
+        for request in requests:
+            raw_input = request.get("tool_input")
+            try:
+                encoded_input = json.dumps(raw_input, ensure_ascii=False)
+            except (TypeError, ValueError):
+                encoded_input = ""
+            summary = {
+                "request_id": _permission_field(request.get("request_id"), 64),
+                "tool_name": _permission_field(request.get("tool_name")),
+                "native_id": _permission_field(request.get("native_id"), 16),
+                "name": _permission_field(request.get("name")),
+                "created_at": request.get("created_at"),
+                "tool_input_omitted": True,
+                "tool_input_chars": len(encoded_input),
+            }
+            if isinstance(raw_input, Mapping):
+                summary["tool_input_keys"] = [
+                    _permission_field(key, 64) for key in list(raw_input.keys())[:20]
+                ]
+            detail = dict(summary)
+            for key in ("managed_cwd", "cwd", "permission_mode", "model", "effort"):
+                if request.get(key) is not None:
+                    detail[key] = _permission_field(request.get(key), 256)
+            if encoded_input and len(encoded_input) <= MAX_PERMISSION_TOOL_INPUT_CHARS:
+                detail["tool_input"] = raw_input
+                detail["tool_input_omitted"] = False
+            summaries.append(summary)
+            details.append(detail)
+
+        payload: dict[str, Any] = {"ok": True, "requests": summaries}
+        for index, detail in enumerate(details):
+            previous = summaries[index]
+            summaries[index] = detail
+            if len(_json(payload)) > MAX_OUTPUT_CHARS:
+                summaries[index] = previous
+        result = _json(payload)
+        if len(result) <= MAX_OUTPUT_CHARS:
+            return result
+        minimal = [
+            {
+                "request_id": summary["request_id"],
+                "tool_name": summary["tool_name"],
+                "tool_input_omitted": True,
+            }
+            for summary in summaries
+        ]
+        return _json({"ok": True, "requests": minimal, "details_omitted": True})
     except Exception:
         return _error("Claude permission list failed unexpectedly")
+
+
+def _permission_field(value: object, limit: int = MAX_PERMISSION_FIELD_CHARS) -> object:
+    if not isinstance(value, str):
+        return value
+    if len(value) <= limit:
+        return value
+    return value[: limit - len(_TRUNCATION_MARKER)] + _TRUNCATION_MARKER
 
 
 def claude_permission_decide(args: object, **kwargs: object) -> str:
@@ -543,6 +693,29 @@ def _owned_id(args: object) -> tuple[str, str] | str:
     return native_id, claude_bin
 
 
+def _archived_logs(session: Path | None, native_id: str) -> str | None:
+    snapshot = lifecycle.read_snapshot(session) if session is not None else None
+    if snapshot is not None and session is not None:
+        status = lifecycle.read_status(session)
+        retirement = {
+            key: status[key]
+            for key in ("state", "native_state", "updated_at", "retry_after", "detail")
+            if status is not None and key in status
+        }
+        return _bounded_log_json(
+            {
+                "ok": snapshot.get("returncode") == 0,
+                "id": native_id,
+                "returncode": snapshot.get("returncode"),
+                "stdout": str(snapshot.get("stdout") or ""),
+                "stderr": str(snapshot.get("stderr") or ""),
+                "archived": True,
+                "retirement": retirement,
+            }
+        )
+    return None
+
+
 def claude_session_logs(args: object, **kwargs: object) -> str:
     """Read logs for a Claude session launched under Hermes management."""
     del kwargs
@@ -550,8 +723,15 @@ def claude_session_logs(args: object, **kwargs: object) -> str:
     if isinstance(parsed, str):
         return parsed
     native_id, claude_bin = parsed
+    session = bridge.find_session(native_id)
+    archived = _archived_logs(session, native_id)
+    if archived is not None:
+        return archived
     completed = _run_claude([claude_bin, "logs", native_id])
     if isinstance(completed, str):
+        archived = _archived_logs(session, native_id)
+        if archived is not None:
+            return archived
         return completed
     payload = {
         "ok": completed.returncode == 0,
@@ -561,8 +741,39 @@ def claude_session_logs(args: object, **kwargs: object) -> str:
         "stderr": _bounded_tail(completed.stderr, LOG_STDERR_CHARS),
     }
     if completed.returncode != 0:
+        archived = _archived_logs(session, native_id)
+        if archived is not None:
+            return archived
         payload["error"] = "Claude command exited with a non-zero status"
     return _bounded_log_json(payload)
+
+
+def _capture_pre_stop_logs(claude_bin: str, native_id: str) -> dict[str, Any] | None:
+    completed = _run_claude([claude_bin, "logs", native_id])
+    if isinstance(completed, str) or completed.returncode != 0:
+        return None
+    return {
+        "version": 1,
+        "id": native_id,
+        "returncode": completed.returncode,
+        "stdout": _bounded_tail(completed.stdout, LOG_STDOUT_CHARS),
+        "stderr": _bounded_tail(completed.stderr, LOG_STDERR_CHARS),
+        "captured_at": time.time(),
+    }
+
+
+def _archive_pre_stop_logs(
+    session: Path | None,
+    snapshot: dict[str, Any] | None,
+    native_state: str,
+) -> None:
+    if (
+        session is None
+        or snapshot is None
+        or lifecycle.read_snapshot(session) is not None
+    ):
+        return
+    lifecycle.write_snapshot(session, {**snapshot, "native_state": native_state})
 
 
 def claude_session_stop(args: object, **kwargs: object) -> str:
@@ -572,6 +783,8 @@ def claude_session_stop(args: object, **kwargs: object) -> str:
     if isinstance(parsed, str):
         return parsed
     native_id, claude_bin = parsed
+    session = bridge.find_session(native_id)
+    snapshot = _capture_pre_stop_logs(claude_bin, native_id)
     completed = _run_claude([claude_bin, "stop", native_id])
     if isinstance(completed, str):
         return completed
@@ -590,9 +803,12 @@ def claude_session_stop(args: object, **kwargs: object) -> str:
         if isinstance(sessions, str):
             return sessions
         matching = [session for session in sessions if session.get("id") == native_id]
-        if not matching or all(
-            session.get("state") in terminal_states for session in matching
-        ):
+        if not matching:
+            _archive_pre_stop_logs(session, snapshot, "stopped")
+            return _json({"ok": True, "id": native_id, "confirmed": True})
+        if all(item.get("state") in terminal_states for item in matching):
+            native_state = str(matching[0].get("state") or "stopped")
+            _archive_pre_stop_logs(session, snapshot, native_state)
             return _json({"ok": True, "id": native_id, "confirmed": True})
         time.sleep(0.2)
     return _error("Claude session stop could not be confirmed", id=native_id)

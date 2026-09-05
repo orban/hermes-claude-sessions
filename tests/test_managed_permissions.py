@@ -10,7 +10,7 @@ from typing import Any
 
 import pytest
 
-from hermes_claude_sessions import bridge, permission_hook, tools
+from hermes_claude_sessions import bridge, lifecycle, permission_hook, tools
 
 
 def decode(value: str) -> dict[str, Any]:
@@ -29,6 +29,121 @@ def prepare_session(
     return session
 
 
+def test_native_id_binding_is_exclusive_and_idempotent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "state"
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    monkeypatch.setattr(bridge, "state_root", lambda: root)
+    first = bridge.create_session("first", repository)
+    second = bridge.create_session("second", repository)
+
+    bridge.set_native_id(first, "a1b2c3d4")
+    bridge.set_native_id(first, "a1b2c3d4")
+
+    with pytest.raises(ValueError, match="already bound"):
+        bridge.set_native_id(second, "a1b2c3d4")
+
+    assert bridge.find_session("a1b2c3d4") == first
+    binding = json.loads(bridge.native_binding_path("a1b2c3d4").read_text())
+    assert binding["native_id"] == "a1b2c3d4"
+    assert binding["session_uuid"] == first.name
+
+
+def test_find_session_migrates_one_legacy_binding_but_rejects_duplicates(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "state"
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    monkeypatch.setattr(bridge, "state_root", lambda: root)
+    first = bridge.create_session("first", repository)
+    metadata = json.loads((first / "metadata.json").read_text())
+    metadata["native_id"] = "a1b2c3d4"
+    bridge._write_json_atomic(first / "metadata.json", metadata)
+
+    assert bridge.find_session("a1b2c3d4") == first
+    assert bridge.native_binding_path("a1b2c3d4").is_file()
+    assert json.loads((first / "metadata.json").read_text())["launch_state"] == (
+        "legacy"
+    )
+
+    bridge.native_binding_path("a1b2c3d4").unlink()
+    second = bridge.create_session("second", repository)
+    other = json.loads((second / "metadata.json").read_text())
+    other["native_id"] = "a1b2c3d4"
+    bridge._write_json_atomic(second / "metadata.json", other)
+
+    assert bridge.find_session("a1b2c3d4") is None
+
+
+def test_find_session_rejects_invalid_binding_session_uuid(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "state"
+    monkeypatch.setattr(bridge, "state_root", lambda: root)
+    bridge._write_json_atomic(
+        bridge.native_binding_path("a1b2c3d4"),
+        {
+            "version": 1,
+            "native_id": "a1b2c3d4",
+            "session_uuid": "../outside",
+        },
+    )
+
+    assert bridge.find_session("a1b2c3d4") is None
+
+
+def test_create_session_sweeps_only_stale_well_formed_temp_directories(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "state"
+    root.mkdir()
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    monkeypatch.setattr(bridge, "state_root", lambda: root)
+    stale = root / f".{('a' * 32)}.{('b' * 32)}.tmp"
+    recent = root / f".{('c' * 32)}.{('d' * 32)}.tmp"
+    malformed = root / ".keep-me.tmp"
+    for path in (stale, recent, malformed):
+        path.mkdir()
+    os.utime(stale, (0, 0))
+
+    session = bridge.create_session("created", repository)
+
+    assert not stale.exists()
+    assert recent.exists()
+    assert malformed.exists()
+    assert bridge.managed_session_directories() == [session]
+
+
+def test_atomic_temp_sweep_is_bounded_to_old_adapter_temp_files(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "state"
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    monkeypatch.setattr(bridge, "state_root", lambda: root)
+    session = bridge.create_session("created", repository)
+    binding_dir = root.parent / "by-native"
+    binding_dir.mkdir(parents=True)
+    stale_session = session / f".metadata.json.{('a' * 32)}.tmp"
+    stale_binding = binding_dir / f".a1b2c3d4.json.{('b' * 32)}.tmp"
+    recent = session / f".recent.json.{('c' * 32)}.tmp"
+    malformed = session / ".keep-me.tmp"
+    for path in (stale_session, stale_binding, recent, malformed):
+        path.write_text("partial", encoding="utf-8")
+    os.utime(stale_session, (0, 0))
+    os.utime(stale_binding, (0, 0))
+
+    assert bridge.sweep_stale_atomic_temps(now=4000.0) == 2
+    assert not stale_session.exists()
+    assert not stale_binding.exists()
+    assert recent.exists()
+    assert malformed.exists()
+
+
 def test_managed_launch_uses_auto_classifier_and_permission_plugin(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -44,7 +159,7 @@ def test_managed_launch_uses_auto_classifier_and_permission_plugin(
         return subprocess.CompletedProcess(
             argv,
             0,
-            "backgrounded · a1b2c3d4 · managed-test\n",
+            f"backgrounded · a1b2c3d4 · {argv[argv.index('--name') + 1]}\n",
             "",
         )
 
@@ -68,14 +183,17 @@ def test_managed_launch_uses_auto_classifier_and_permission_plugin(
     assert result["model"] == "sonnet"
     assert result["effort"] == "high"
     argv, kwargs = calls[0]
+    launch_name = argv[3]
     assert argv[:6] == [
         "/mock/claude",
         "--bg",
         "--name",
-        "managed-test",
+        launch_name,
         "--permission-mode",
         "auto",
     ]
+    assert launch_name.startswith("managed-test-")
+    assert "--session-id" not in argv
     assert argv[6:10] == ["--model", "sonnet", "--effort", "high"]
     plugin_index = argv.index("--plugin-dir")
     session_plugin = Path(argv[plugin_index + 1])
@@ -89,6 +207,8 @@ def test_managed_launch_uses_auto_classifier_and_permission_plugin(
     assert metadata["name"] == "managed-test"
     assert metadata["model"] == "sonnet"
     assert metadata["effort"] == "high"
+    assert metadata["launch_name"] == launch_name
+    assert "native_session_id" not in metadata
     assert "work" not in json.dumps(metadata)
     assert session_plugin == session_dir / "claude-plugin"
     hook_config = json.loads((session_plugin / "hooks" / "hooks.json").read_text())
@@ -181,7 +301,7 @@ def test_executable_permission_hook_round_trip(
     environment = os.environ.copy()
     environment[bridge.TIMEOUT_ENV] = "2"
     process = subprocess.Popen(
-        [str(executable), str(session)],
+        [tools.sys.executable, str(executable), str(session)],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -598,6 +718,104 @@ def test_stop_accepts_native_done_as_terminal(
     result = decode(tools.claude_session_stop({"id": "a1b2c3d4"}))
 
     assert result == {"ok": True, "id": "a1b2c3d4", "confirmed": True}
+
+
+def test_stop_archives_logs_before_native_record_disappears(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    prepare_session(monkeypatch, tmp_path)
+    monkeypatch.setattr(tools, "resolve_claude_bin", lambda: "/mock/claude")
+    calls: list[list[str]] = []
+
+    def run(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        if argv[1] == "logs":
+            return subprocess.CompletedProcess(argv, 0, "final output", "")
+        if argv[1] == "stop":
+            return subprocess.CompletedProcess(argv, 0, "stopped", "")
+        raise AssertionError(argv)
+
+    monkeypatch.setattr(tools, "_run_claude", run)
+    monkeypatch.setattr(tools, "_native_sessions", lambda binary: [])
+
+    stopped = decode(tools.claude_session_stop({"id": "a1b2c3d4"}))
+
+    assert stopped == {"ok": True, "id": "a1b2c3d4", "confirmed": True}
+    assert calls == [
+        ["/mock/claude", "logs", "a1b2c3d4"],
+        ["/mock/claude", "stop", "a1b2c3d4"],
+    ]
+    snapshot = lifecycle.read_snapshot(bridge.find_session("a1b2c3d4"))
+    assert snapshot is not None
+    assert snapshot["id"] == "a1b2c3d4"
+    assert snapshot["native_state"] == "stopped"
+    assert snapshot["returncode"] == 0
+    assert snapshot["stdout"] == "final output"
+    assert snapshot["stderr"] == ""
+
+    monkeypatch.setattr(
+        tools,
+        "_run_claude",
+        lambda argv: pytest.fail(f"native logs called after stop: {argv}"),
+    )
+    archived = decode(tools.claude_session_logs({"id": "a1b2c3d4"}))
+    assert archived["ok"] is True
+    assert archived["archived"] is True
+    assert archived["stdout"] == "final output"
+
+
+def test_stop_succeeds_when_pre_stop_logs_are_unavailable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    session = prepare_session(monkeypatch, tmp_path)
+    monkeypatch.setattr(tools, "resolve_claude_bin", lambda: "/mock/claude")
+
+    def run(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        if argv[1] == "logs":
+            return subprocess.CompletedProcess(argv, 1, "", "job not found")
+        if argv[1] == "stop":
+            return subprocess.CompletedProcess(argv, 0, "stopped", "")
+        raise AssertionError(argv)
+
+    monkeypatch.setattr(tools, "_run_claude", run)
+    monkeypatch.setattr(tools, "_native_sessions", lambda binary: [])
+
+    stopped = decode(tools.claude_session_stop({"id": "a1b2c3d4"}))
+
+    assert stopped == {"ok": True, "id": "a1b2c3d4", "confirmed": True}
+    assert lifecycle.read_snapshot(session) is None
+
+
+def test_stop_never_overwrites_an_existing_snapshot(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    session = prepare_session(monkeypatch, tmp_path)
+    original = {
+        "version": 1,
+        "id": "a1b2c3d4",
+        "native_state": "done",
+        "returncode": 0,
+        "stdout": "original output",
+        "stderr": "",
+        "captured_at": 1.0,
+    }
+    lifecycle.write_snapshot(session, original)
+    monkeypatch.setattr(tools, "resolve_claude_bin", lambda: "/mock/claude")
+
+    def run(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        if argv[1] == "logs":
+            return subprocess.CompletedProcess(argv, 0, "new output", "")
+        if argv[1] == "stop":
+            return subprocess.CompletedProcess(argv, 0, "stopped", "")
+        raise AssertionError(argv)
+
+    monkeypatch.setattr(tools, "_run_claude", run)
+    monkeypatch.setattr(tools, "_native_sessions", lambda binary: [])
+
+    stopped = decode(tools.claude_session_stop({"id": "a1b2c3d4"}))
+
+    assert stopped == {"ok": True, "id": "a1b2c3d4", "confirmed": True}
+    assert lifecycle.read_snapshot(session) == original
 
 
 def test_stop_requires_readback_confirmation(

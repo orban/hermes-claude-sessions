@@ -225,8 +225,10 @@ def test_lifecycle_probe_reconciles_exact_identity_exercises_identifiers_and_cle
             return CommandCapture(argv, 1, "", "not found", False, None)
         if argv[1] == "stop":
             row["state"] = "stopped"
-        elif argv[1] == "respawn":
+        elif argv[1] == "rm":
             rows.pop(row["sessionId"])
+        elif argv[1] == "respawn":
+            row["state"] = "stopped"
             full = next(generations)
             rows[full] = {
                 "id": full[:8],
@@ -257,6 +259,20 @@ def test_lifecycle_probe_reconciles_exact_identity_exercises_identifiers_and_cle
 
     assert result["cleanup"]["confirmed"] is True
     assert result["unrelated_agents"]["unchanged"] is True
+    removals = [call for call in calls if call[1] == "rm"]
+    assert {call[2] for call in removals} == {
+        "11111111",
+        "22222222",
+        "33333333",
+    }
+    assert rows == {
+        unrelated: {
+            "id": "aaaaaaaa",
+            "sessionId": unrelated,
+            "name": "unrelated",
+            "state": "running",
+        }
+    }
     assert result["identifier_acceptance"] == {
         "logs": {"short": "accepted", "full_uuid": "accepted"},
         "stop": {"short": "accepted", "full_uuid": "accepted"},
@@ -411,6 +427,7 @@ def test_missing_respawn_token_recovers_exact_replacement_for_cleanup(
     launched = False
     replacement_created = False
     stop_targets: list[str] = []
+    rm_targets: list[str] = []
 
     monkeypatch.setattr(
         "tests.characterization.support._require_exact_observer_capability",
@@ -456,6 +473,11 @@ def test_missing_respawn_token_recovers_exact_replacement_for_cleanup(
             if argv[2] in {current["id"], current["sessionId"]}:
                 current["state"] = "stopped"
             return CommandCapture(argv, 0, "", "", False, None)
+        if argv[1] == "rm":
+            rm_targets.append(argv[2])
+            if argv[2] in {current["id"], current["sessionId"]}:
+                launched = False
+            return CommandCapture(argv, 0, "", "", False, None)
         if argv[1] == "respawn":
             spelling = "short" if argv[2] == current["id"] else "full_uuid"
             if replacement_created or spelling != accepted_spelling:
@@ -480,7 +502,7 @@ def test_missing_respawn_token_recovers_exact_replacement_for_cleanup(
     )
     assert result["cleanup"]["confirmed"] is True
     assert replacement_created
-    assert "22222222" in stop_targets
+    assert "22222222" in rm_targets
 
 
 def test_new_respawn_token_is_the_final_cleanup_capability_on_ambiguity(

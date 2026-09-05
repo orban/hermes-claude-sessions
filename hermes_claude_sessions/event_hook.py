@@ -13,29 +13,16 @@ from . import bridge
 
 MAX_HOOK_INPUT_CHARS = 131_072
 EventMapping = tuple[str, str, str | None, dict[str, object]]
+_ATTENTION_NOTIFICATIONS = {
+    "permission_prompt",
+    "idle_prompt",
+    "agent_needs_input",
+}
 
 
 def _event_for(payload: Mapping[str, object], session: Path) -> EventMapping | None:
     hook = payload.get("hook_event_name")
-    terminal_id = f"terminal-{session.name}"
     if hook == "Notification":
-        notification_type = str(payload.get("notification_type") or "")
-        if notification_type == "agent_needs_input":
-            return (
-                "needs_input",
-                "Managed Claude session needs input. "
-                "Inspect its authoritative state and logs.",
-                None,
-                {"notification_type": notification_type},
-            )
-        if notification_type == "agent_completed":
-            return (
-                "completed",
-                "Managed Claude session completed. Read its logs, inspect the "
-                "artifacts, and independently verify the work.",
-                terminal_id,
-                {"notification_type": notification_type},
-            )
         return None
     if hook == "Stop":
         return (
@@ -45,23 +32,19 @@ def _event_for(payload: Mapping[str, object], session: Path) -> EventMapping | N
             None,
             {},
         )
-    if hook == "StopFailure":
-        return (
-            "failed",
-            "Managed Claude session hit an API failure. Inspect its authoritative "
-            "state and logs before deciding whether to retry.",
-            terminal_id,
-            {},
-        )
-    if hook == "SessionEnd":
-        return (
-            "session_ended",
-            "Managed Claude session ended. Inspect its logs and verify any produced "
-            "artifacts.",
-            terminal_id,
-            {},
-        )
     return None
+
+
+def _is_reconciliation_hint(payload: Mapping[str, object]) -> bool:
+    hook = payload.get("hook_event_name")
+    if hook in {"StopFailure", "SessionEnd"}:
+        return True
+    if hook != "Notification":
+        return False
+    notification_type = payload.get("notification_type")
+    return notification_type == "agent_completed" or notification_type in (
+        _ATTENTION_NOTIFICATIONS
+    )
 
 
 def run(
@@ -86,17 +69,17 @@ def run(
         if not (session / "metadata.json").is_file():
             return 0
         mapped = _event_for(payload, session)
-        if mapped is None:
-            return 0
-        kind, message, event_id, safe_payload = mapped
-        bridge.enqueue_event(
-            session,
-            kind=kind,
-            message=message,
-            event_id=event_id,
-            payload=safe_payload,
-        )
-        bridge.signal_dispatcher(session)
+        if mapped is not None:
+            kind, message, event_id, safe_payload = mapped
+            bridge.enqueue_event(
+                session,
+                kind=kind,
+                message=message,
+                event_id=event_id,
+                payload=safe_payload,
+            )
+        if mapped is not None or _is_reconciliation_hint(payload):
+            bridge.signal_dispatcher(session)
     except Exception:
         return 0
     return 0

@@ -376,18 +376,29 @@ def test_run_command_allows_only_exact_safe_suffixes(tmp_path: Path) -> None:
     assert capture.argv == (str(tmp_path / "claude"), "--version")
 
 
-def test_agents_json_payload_requires_a_list_of_identified_agent_objects() -> None:
-    assert frozenset(("id", "name", "state")) == REQUIRED_AGENT_OBJECT_KEYS
+def test_agents_json_payload_requires_launch_reconciliation_fields() -> None:
+    assert (
+        frozenset(("id", "name", "state", "cwd", "startedAt"))
+        == REQUIRED_AGENT_OBJECT_KEYS
+    )
     validate_agents_json_payload([])
     validate_agents_json_payload(
-        [{"id": "agent-1", "name": "worker", "state": "running"}]
+        [
+            {
+                "id": "agent-1",
+                "name": "worker",
+                "state": "running",
+                "cwd": "/tmp/repo",
+                "startedAt": 1000,
+            }
+        ]
     )
 
     with pytest.raises(TypeError, match="top-level JSON array"):
         validate_agents_json_payload({"agents": []})
     with pytest.raises(TypeError, match="an object"):
         validate_agents_json_payload(["agent-1"])
-    with pytest.raises(ValueError, match="name, state"):
+    with pytest.raises(ValueError, match="cwd, name, startedAt, state"):
         validate_agents_json_payload([{"id": "agent-1"}])
 
 
@@ -636,9 +647,13 @@ def test_unattended_probe_isolates_exact_uuid_cases_and_waits_before_stop(
                 f"backgrounded · {session_id[:8]} · {name}\n"
             )
             return CommandCapture(argv, 0, output, "", False, None)
-        elif argv[1] == "stop":
-            session_id = next(key for key in active if key.startswith(f"{argv[2]}-"))
-            active.pop(session_id)
+        if argv[1] in {"stop", "rm"}:
+            session_id = next(key for key in active if argv[2] in {key, key[:8]})
+            if argv[1] == "stop":
+                name = active[session_id].split(":", 1)[1]
+                active[session_id] = f"stopped:{name}"
+            else:
+                active.pop(session_id)
         if argv[1:3] == ("agents", "--json"):
             rows = [
                 {
@@ -670,8 +685,10 @@ def test_unattended_probe_isolates_exact_uuid_cases_and_waits_before_stop(
 
     launches = [argv for argv in calls if argv[1] == "--bg"]
     stops = [argv for argv in calls if argv[1] == "stop"]
+    removals = [argv for argv in calls if argv[1] == "rm"]
     assert len(launches) == len(OBSERVER_EVENT_MATCHERS[2:])
     assert len(stops) == len(launches)
+    assert len(removals) == len(launches)
     assert result["estimated_test_owned_session_count"] == len(launches)
     assert result["actual_test_owned_session_count"] == len(launches)
     assert result["cleanup"]["confirmed"] is True
@@ -681,13 +698,15 @@ def test_unattended_probe_isolates_exact_uuid_cases_and_waits_before_stop(
     assert all("owned_display_id" not in probe for probe in result["probes"])
     assert all("owned_session_id" not in probe for probe in result["probes"])
     assert all(probe["launch_token_reconciled"] is True for probe in result["probes"])
-    for launch, stop in zip(launches, stops, strict=True):
+    for launch, stop, removal in zip(launches, stops, removals, strict=True):
         launch_index = next(i for i, call in enumerate(calls) if call is launch)
         stop_index = next(i for i, call in enumerate(calls) if call is stop)
+        removal_index = next(i for i, call in enumerate(calls) if call is removal)
         assert launch[3].startswith("observer-")
         assert len(stop[2]) == 8
+        assert stop[2] == removal[2]
         assert "-p" not in launch
-        assert launch_index < stop_index
+        assert launch_index < stop_index < removal_index
         assert any(
             call[1:3] == ("agents", "--json") and launch_index < index < stop_index
             for index, call in enumerate(calls)
@@ -754,8 +773,18 @@ def test_every_post_launch_failure_still_stops_exact_launch_tokens(
             output = f"backgrounded · {session_id[:8]} · {argv[3]}\n"
             return CommandCapture(argv, 0, output, "", False, None)
         if argv[1] == "stop":
-            match = next(row for row in rows.values() if row["id"] == argv[2])
+            match = next(
+                row for row in rows.values() if argv[2] in {row["id"], row["sessionId"]}
+            )
             match["state"] = "stopped"
+            return CommandCapture(argv, 0, "", "", False, None)
+        if argv[1] == "rm":
+            session_id = next(
+                key
+                for key, row in rows.items()
+                if argv[2] in {row["id"], row["sessionId"]}
+            )
+            rows.pop(session_id)
             return CommandCapture(argv, 0, "", "", False, None)
         if argv[1:3] == ("agents", "--json"):
             return CommandCapture(
@@ -802,17 +831,22 @@ def test_every_post_launch_failure_still_stops_exact_launch_tokens(
 
     launches = [argv for argv in calls if argv[1] == "--bg"]
     stops = [argv for argv in calls if argv[1] == "stop"]
+    removals = [argv for argv in calls if argv[1] == "rm"]
     assert len(launches) == len(OBSERVER_EVENT_MATCHERS[2:])
     assert len(stops) == len(launches)
-    assert {argv[2] for argv in stops} == {
-        row["id"] for row in rows.values() if row["name"].startswith("observer-")
-    }
     assert rows[unrelated_id]["state"] == "blocked"
-    assert all(
-        row["state"] == "stopped"
-        for row in rows.values()
-        if row["name"].startswith("observer-")
-    )
+    if failure == "observer":
+        assert {argv[2] for argv in stops} == {argv[2] for argv in removals}
+        assert all(len(argv[2]) == 8 for argv in stops)
+        assert list(rows) == [unrelated_id]
+    else:
+        assert removals == []
+        assert all(len(argv[2]) == 8 for argv in stops)
+        assert all(
+            row["state"] == "stopped"
+            for key, row in rows.items()
+            if key != unrelated_id
+        )
 
 
 def test_probe_fails_without_identity_readback_and_never_guesses_stop(
@@ -1005,12 +1039,13 @@ def test_cleanup_accepts_exact_done_terminal_state(
             argv, 0, "", "", False, None
         ),
     )
+    listings = iter(([terminal], []))
     monkeypatch.setattr(
         "tests.characterization.support._listing",
         lambda *args: CommandCapture(
             (EXACT_CLAUDE_BIN, "agents", "--json", "--all"),
             0,
-            json.dumps([terminal]),
+            json.dumps(next(listings)),
             "",
             False,
             None,
@@ -1062,7 +1097,7 @@ def test_probe_fails_when_cleanup_listing_has_duplicate_exact_rows(
             listed = [
                 row
                 for row in rows.values()
-                for _ in range(2 if row["id"] in stopped else 1)
+                for _ in range(2 if {row["id"], row["sessionId"]} & stopped else 1)
             ]
             return CommandCapture(argv, 0, json.dumps(listed), "", False, None)
         raise AssertionError(argv)
@@ -1172,6 +1207,7 @@ def test_hard_command_deadlines_leave_time_for_all_exact_observer_cleanup(
 ) -> None:
     tokens: dict[str, str] = {}
     stopped: list[str] = []
+    removed: list[str] = []
 
     def token_for(name: str) -> str:
         if name not in tokens:
@@ -1202,15 +1238,19 @@ def test_hard_command_deadlines_leave_time_for_all_exact_observer_cleanup(
         if argv[1] == "stop":
             stopped.append(argv[2])
             return CommandCapture(argv, 0, "", "", False, None)
+        if argv[1] == "rm":
+            removed.append(argv[2])
+            return CommandCapture(argv, 0, "", "", False, None)
         if argv[1:3] == ("agents", "--json"):
             rows = []
-            if display_id is not None and session_id is None:
+            if display_id is not None and display_id not in removed:
                 rows = [
                     {
                         "id": display_id,
-                        "sessionId": f"{display_id}-0000-4000-8000-000000000000",
+                        "sessionId": session_id
+                        or f"{display_id}-0000-4000-8000-000000000000",
                         "name": display_name,
-                        "state": "running",
+                        "state": "stopped" if display_id in stopped else "running",
                     }
                 ]
             return CommandCapture(argv, 0, json.dumps(rows), "", False, None)
@@ -1259,6 +1299,7 @@ def test_hard_command_deadlines_leave_time_for_all_exact_observer_cleanup(
     assert result["actual_test_owned_session_count"] == 4
     assert result["cleanup"]["confirmed"] is True
     assert stopped == list(tokens.values())
+    assert removed == stopped
     assert elapsed < 2.0
 
 

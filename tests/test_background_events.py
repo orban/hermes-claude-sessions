@@ -110,13 +110,20 @@ def test_permission_hook_event_is_published_before_waiting(tmp_path):
     assert decision["behavior"] == "deny"
 
 
-def test_observer_hook_maps_state_changes_without_copying_claude_output(tmp_path):
+@pytest.mark.parametrize(
+    "notification_type", ["permission_prompt", "idle_prompt", "agent_needs_input"]
+)
+def test_observer_hook_treats_attention_notifications_as_reconciliation_hints(
+    monkeypatch, tmp_path, notification_type
+):
     session = _session(tmp_path)
+    signals = []
+    monkeypatch.setattr(bridge, "signal_dispatcher", signals.append)
     payload = {
-        "hook_event_name": "StopFailure",
+        "hook_event_name": "Notification",
+        "notification_type": notification_type,
         "session_id": "claude-session",
-        "error": "SECRET=provider-token",
-        "error_details": "secret provider detail",
+        "message": "SECRET=provider-token",
         "last_assistant_message": "untrusted model output",
     }
 
@@ -129,59 +136,52 @@ def test_observer_hook_maps_state_changes_without_copying_claude_output(tmp_path
         == 0
     )
 
-    found = bridge.list_pending_events()
-    assert len(found) == 1
-    event = found[0][1]
-    assert event["kind"] == "failed"
-    encoded = json.dumps(event)
-    assert "provider-token" not in encoded
-    assert "secret provider detail" not in encoded
-    assert "untrusted model output" not in encoded
+    assert bridge.list_pending_events() == []
+    assert signals == [session]
 
-    session_end = {
-        "hook_event_name": "SessionEnd",
-        "session_id": "claude-session",
-        "reason": "SECRET=session-end-token",
-    }
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"hook_event_name": "Notification", "notification_type": "agent_completed"},
+        {"hook_event_name": "StopFailure", "error": "SECRET=provider-token"},
+        {"hook_event_name": "SessionEnd", "reason": "SECRET=session-end-token"},
+    ],
+)
+def test_terminal_hook_hints_only_signal_authoritative_state_reconciliation(
+    monkeypatch, tmp_path, payload
+):
+    session = _session(tmp_path)
+    signals = []
+    monkeypatch.setattr(
+        bridge,
+        "signal_dispatcher",
+        lambda value: signals.append(value),
+    )
+
     assert (
         event_hook.run(
-            stdin=io.StringIO(json.dumps(session_end)),
+            stdin=io.StringIO(json.dumps(payload)),
             stdout=io.StringIO(),
             environ={bridge.SESSION_DIR_ENV: str(session)},
         )
         == 0
     )
-    assert len(bridge.list_pending_events()) == 1
+    assert bridge.list_pending_events() == []
+    assert signals == [session]
 
 
-@pytest.mark.parametrize("hook", ["StopFailure", "SessionEnd"])
-def test_observer_hook_drops_untrusted_failure_and_end_details(tmp_path, hook):
-    session = _session(tmp_path)
-
-    mapped = event_hook._event_for(
-        {
-            "hook_event_name": hook,
-            "error": "SECRET=provider-token",
-            "reason": "SECRET=session-end-token",
-        },
-        session,
-    )
-
-    assert mapped is not None
-    assert mapped[3] == {}
-    assert "SECRET" not in json.dumps(mapped)
-
-
-def test_executable_event_hook_uses_explicit_session_argument(tmp_path):
+def test_executable_event_hook_treats_attention_as_reconciliation_hint(tmp_path):
     session = _session(tmp_path)
     executable = tools._CLAUDE_PLUGIN_DIR / "hooks" / "event_bridge.py"
     completed = subprocess.run(
         [tools.sys.executable, str(executable), str(session)],
         input=json.dumps(
             {
-                "hook_event_name": "SessionEnd",
+                "hook_event_name": "Notification",
+                "notification_type": "idle_prompt",
                 "session_id": "claude-session",
-                "reason": "other",
+                "message": "waiting",
             }
         ),
         capture_output=True,
@@ -191,12 +191,120 @@ def test_executable_event_hook_uses_explicit_session_argument(tmp_path):
 
     assert completed.returncode == 0
     assert completed.stderr == ""
-    found = bridge.list_pending_events()
-    assert len(found) == 1
-    assert found[0][1]["kind"] == "session_ended"
+    assert bridge.list_pending_events() == []
 
 
-def test_native_terminal_state_enqueues_once_without_output(tmp_path):
+def test_native_blocked_state_is_reconciled_without_hook_delivery(tmp_path):
+    session = _session(tmp_path)
+    state_path = tmp_path / "claude" / "jobs" / "a1b2c3d4" / "state.json"
+    state_path.parent.mkdir(parents=True)
+    bridge.set_native_id(session, "a1b2c3d4", native_state_path=state_path)
+    state_path.write_text(json.dumps({"state": "blocked"}), encoding="utf-8")
+    os.utime(state_path, ns=(1_000, 1_000))
+
+    assert bridge.enqueue_native_state_events() == 1
+    event = bridge.list_pending_events()[0][1]
+    assert event["kind"] == "needs_input"
+    assert event["payload"] == {"native_state": "blocked"}
+    assert event["event_id"] == f"blocked-{session.name}-1"
+
+    claim = bridge.claim_next_event(session, consumer="wait")
+    assert claim is not None
+    assert bridge.complete_event_claim(claim, disposition="consumed") is True
+    assert bridge.enqueue_native_state_events() == 0
+
+    state_path.write_text(
+        json.dumps({"state": "blocked", "tokens": 123}), encoding="utf-8"
+    )
+    os.utime(state_path, ns=(2_000, 2_000))
+    assert bridge.enqueue_native_state_events() == 0
+
+    state_path.write_text(json.dumps({"state": "running"}), encoding="utf-8")
+    os.utime(state_path, ns=(3_000, 3_000))
+    assert bridge.enqueue_native_state_events() == 0
+    state_path.write_text(json.dumps({"state": "blocked"}), encoding="utf-8")
+    os.utime(state_path, ns=(4_000, 4_000))
+
+    assert bridge.enqueue_native_state_events() == 1
+    assert bridge.list_pending_events()[0][1]["event_id"] == (
+        f"blocked-{session.name}-2"
+    )
+
+
+def test_attention_hook_and_blocked_state_produce_one_event(tmp_path):
+    session = _session(tmp_path)
+    state_path = tmp_path / "claude" / "jobs" / "a1b2c3d4" / "state.json"
+    state_path.parent.mkdir(parents=True)
+    bridge.set_native_id(session, "a1b2c3d4", native_state_path=state_path)
+    state_path.write_text(json.dumps({"state": "blocked"}), encoding="utf-8")
+
+    assert (
+        event_hook.run(
+            stdin=io.StringIO(
+                json.dumps(
+                    {
+                        "hook_event_name": "Notification",
+                        "notification_type": "permission_prompt",
+                    }
+                )
+            ),
+            stdout=io.StringIO(),
+            environ={bridge.SESSION_DIR_ENV: str(session)},
+        )
+        == 0
+    )
+    assert bridge.list_pending_events() == []
+    assert bridge.enqueue_native_state_events() == 1
+    pending = bridge.list_pending_events()
+    assert len(pending) == 1
+    assert pending[0][1]["event_id"] == f"blocked-{session.name}-1"
+
+
+def test_permission_request_suppresses_duplicate_blocked_state_event(tmp_path):
+    session = _session(tmp_path)
+    state_path = tmp_path / "claude" / "jobs" / "a1b2c3d4" / "state.json"
+    state_path.parent.mkdir(parents=True)
+    bridge.set_native_id(session, "a1b2c3d4", native_state_path=state_path)
+    request = bridge.enqueue_request(
+        session,
+        {"tool_name": "Bash", "tool_input": {"command": "git status"}},
+    )
+    bridge.enqueue_event(
+        session,
+        kind="permission_required",
+        message="Managed Claude session is waiting for permission.",
+        event_id=f"permission-{request['request_id']}",
+        payload={"request_id": request["request_id"]},
+    )
+    state_path.write_text(json.dumps({"state": "blocked"}), encoding="utf-8")
+
+    assert bridge.enqueue_native_state_events() == 0
+    pending = bridge.list_pending_events()
+    assert len(pending) == 1
+    assert pending[0][1]["kind"] == "permission_required"
+    assert pending[0][1]["event_id"] == f"permission-{request['request_id']}"
+
+
+def test_legacy_managed_session_reconstructs_native_state_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    session = _session(tmp_path)
+    metadata = json.loads((session / "metadata.json").read_text())
+    metadata["native_id"] = "a1b2c3d4"
+    metadata.pop("native_state_path", None)
+    bridge._write_json_atomic(session / "metadata.json", metadata)
+    state_path = bridge.native_job_state_path("a1b2c3d4")
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text(json.dumps({"state": "done"}), encoding="utf-8")
+
+    assert state_path.parent in bridge.native_state_watch_directories()
+    assert bridge.enqueue_native_state_events() == 0
+    assert bridge.list_pending_events() == []
+    assert bridge._read_json(session / "native-observation.json")["state"] == "done"
+
+
+def test_native_terminal_state_is_a_stable_reconciliation_hint(tmp_path, monkeypatch):
     session = _session(tmp_path)
     state_path = tmp_path / "claude" / "jobs" / "a1b2c3d4" / "state.json"
     state_path.parent.mkdir(parents=True)
@@ -209,19 +317,74 @@ def test_native_terminal_state_enqueues_once_without_output(tmp_path):
         json.dumps({"state": "done", "output": "untrusted model output"}),
         encoding="utf-8",
     )
-    assert bridge.enqueue_native_terminal_events() == 1
-    pending = bridge.list_pending_events()
-    assert len(pending) == 1
-    event = pending[0][1]
-    assert event["kind"] == "completed"
-    assert event["event_id"] == f"terminal-{session.name}"
-    assert "output" not in event["payload"]
-
-    claim = bridge.claim_next_event(session, consumer="wait")
-    assert claim is not None
-    assert bridge.complete_event_claim(claim, disposition="consumed") is True
     assert bridge.enqueue_native_terminal_events() == 0
     assert bridge.list_pending_events() == []
+    observation = bridge._read_json(session / "native-observation.json")
+    assert observation is not None
+    assert observation["state"] == "done"
+    assert "output" not in observation
+    monkeypatch.setattr(
+        bridge,
+        "_write_json_atomic",
+        lambda *args, **kwargs: pytest.fail("stable terminal state was rewritten"),
+    )
+    assert bridge.enqueue_native_terminal_events() == 0
+    assert bridge._read_json(session / "native-observation.json") == observation
+    assert bridge.list_pending_events() == []
+
+
+def test_dispatcher_schedules_lifecycle_after_terminal_event_scan(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        bridge,
+        "enqueue_native_terminal_events",
+        lambda: calls.append("terminal-events") or 0,
+    )
+    dispatcher = events.EventDispatcher(
+        reconcile_lifecycle=lambda: calls.append("lifecycle"),
+    )
+
+    dispatcher._reconcile_native_state()
+    assert calls == ["terminal-events"]
+    dispatcher._run_lifecycle_once()
+
+    assert calls == ["terminal-events", "lifecycle"]
+
+
+def test_dispatcher_contains_lifecycle_reconciliation_failures(monkeypatch):
+    monkeypatch.setattr(bridge, "enqueue_native_terminal_events", lambda: 0)
+    dispatcher = events.EventDispatcher(
+        reconcile_lifecycle=lambda: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+
+    dispatcher._reconcile_native_state()
+    dispatcher._run_lifecycle_once()
+
+
+def test_watch_session_never_runs_lifecycle_inline(monkeypatch, tmp_path):
+    monkeypatch.setattr(bridge, "enqueue_native_terminal_events", lambda: 0)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def reconcile() -> None:
+        entered.set()
+        release.wait(timeout=1)
+
+    dispatcher = events.EventDispatcher(
+        capture_route=lambda **kwargs: {},
+        publish=lambda **kwargs: {"ok": True},
+        reconcile_lifecycle=reconcile,
+    )
+    dispatcher.start()
+    assert entered.wait(timeout=1)
+
+    started = time.monotonic()
+    try:
+        dispatcher.watch_session(tmp_path / "session")
+        assert time.monotonic() - started < 0.1
+    finally:
+        release.set()
+        dispatcher.stop()
 
 
 @pytest.mark.parametrize(
@@ -242,7 +405,7 @@ def test_native_terminal_states_preserve_failure_semantics(
     bridge.set_native_id(session, "c3d4e5f6", native_state_path=state_path)
     state_path.write_text(json.dumps({"state": native_state}), encoding="utf-8")
 
-    assert bridge.enqueue_native_terminal_events() == 1
+    assert bridge.enqueue_terminal_event(session, native_state) is True
     event = bridge.list_pending_events()[0][1]
     assert event["kind"] == expected_kind
     assert event["payload"] == {"native_state": native_state}
@@ -258,7 +421,16 @@ def test_kqueue_state_change_publishes_without_polling(tmp_path):
         published_event.set()
         return {"ok": True, "status": "published"}
 
-    dispatcher = events.EventDispatcher(reconcile_seconds=30)
+    session: Path | None = None
+
+    def reconcile_lifecycle() -> None:
+        assert session is not None
+        bridge.enqueue_terminal_event(session, "done")
+
+    dispatcher = events.EventDispatcher(
+        reconcile_lifecycle=reconcile_lifecycle,
+        reconcile_seconds=30,
+    )
     dispatcher.configure(capture_route=lambda **_kwargs: {}, publish=publish)
     socket_path = dispatcher.start()
     session = _session(tmp_path, event_socket=socket_path)
@@ -317,6 +489,138 @@ def test_dispatcher_publishes_then_moves_spool_record(tmp_path):
         }
     ]
     assert bridge.list_pending_events() == []
+
+
+def _routeless_session(tmp_path: Path) -> Path:
+    return bridge.create_session(
+        "event-test-routeless", tmp_path, route={}, event_socket=""
+    )
+
+
+def test_dispatcher_dead_letters_route_less_event_without_publishing(tmp_path):
+    session = _routeless_session(tmp_path)
+    bridge.enqueue_event(
+        session, kind="completed", message="done", event_id="event-noroute"
+    )
+    published: list[dict[str, object]] = []
+    dispatcher = events.EventDispatcher(
+        capture_route=lambda **_kwargs: {},
+        publish=lambda **kwargs: published.append(dict(kwargs)) or {"ok": True},
+        reconcile_seconds=60,
+    )
+
+    assert dispatcher.drain_once() == 0
+    assert dispatcher.drain_once() == 0  # no retry churn
+    assert published == []
+    assert bridge.list_pending_events() == []
+    record = bridge._read_json(
+        session / "events" / "undeliverable" / "event-noroute.json"
+    )
+    assert record is not None
+    assert record["undeliverable_reason"] == "route has no routable session identity"
+    assert isinstance(record["undeliverable_at"], float)
+    assert bridge._existing_event(session, "event-noroute") is not None
+    # A dead-lettered terminal record still coalesces later terminal hints.
+    assert bridge.enqueue_terminal_event(session, "done") is True
+    assert dispatcher.drain_once() == 0
+    assert (
+        session / "events" / "undeliverable" / f"terminal-{session.name}.json"
+    ).is_file()
+    assert bridge.enqueue_terminal_event(session, "done") is False
+
+
+def test_dispatcher_dead_letters_after_bounded_publish_failures(tmp_path):
+    session = _session(tmp_path)
+    bridge.enqueue_event(
+        session, kind="needs_input", message="x", event_id="event-flaky"
+    )
+    calls: list[int] = []
+    dispatcher = events.EventDispatcher(
+        capture_route=lambda **_kwargs: {},
+        publish=lambda **_kwargs: (
+            calls.append(1) or {"ok": False, "error": "temporary"}
+        ),
+        reconcile_seconds=60,
+    )
+
+    for attempt in range(1, bridge.MAX_PUBLISH_ATTEMPTS):
+        assert dispatcher.drain_once() == 0
+        pending = bridge.list_pending_events()
+        assert pending[0][1]["publish_attempts"] == attempt
+        assert pending[0][1]["publish_last_error"] == "temporary"
+    assert dispatcher.drain_once() == 0
+    assert bridge.list_pending_events() == []
+    assert len(calls) == bridge.MAX_PUBLISH_ATTEMPTS
+    record = bridge._read_json(
+        session / "events" / "undeliverable" / "event-flaky.json"
+    )
+    assert record is not None
+    assert record["publish_attempts"] == bridge.MAX_PUBLISH_ATTEMPTS
+    assert record["undeliverable_reason"].startswith("publish failed 5 times")
+    assert dispatcher.drain_once() == 0  # nothing left to retry
+
+
+def test_dispatcher_dead_letters_when_publish_raises_repeatedly(tmp_path):
+    session = _session(tmp_path)
+    bridge.enqueue_event(session, kind="completed", message="x", event_id="event-raise")
+
+    def _boom(**_kwargs):
+        raise ValueError("route has no routable session identity")
+
+    dispatcher = events.EventDispatcher(
+        capture_route=lambda **_kwargs: {}, publish=_boom, reconcile_seconds=60
+    )
+    for _ in range(bridge.MAX_PUBLISH_ATTEMPTS):
+        assert dispatcher.drain_once() == 0
+    record = bridge._read_json(
+        session / "events" / "undeliverable" / "event-raise.json"
+    )
+    assert record is not None
+    assert (
+        "ValueError: route has no routable session identity"
+        in record["publish_last_error"]
+    )
+
+
+def test_wait_still_consumes_a_dead_lettered_event(tmp_path):
+    session = _routeless_session(tmp_path)
+    bridge.enqueue_event(
+        session, kind="completed", message="done", event_id="event-late"
+    )
+    dispatcher = events.EventDispatcher(
+        capture_route=lambda **_kwargs: {},
+        publish=lambda **_kwargs: {"ok": True},
+        reconcile_seconds=60,
+    )
+    assert dispatcher.drain_once() == 0
+    assert (session / "events" / "undeliverable" / "event-late.json").is_file()
+
+    event = dispatcher.wait_for_event(session, timeout_seconds=0.2)
+
+    assert event is not None
+    assert event["event_id"] == "event-late"
+    assert event["undeliverable_reason"] == "route has no routable session identity"
+    assert (session / "events" / "consumed" / "event-late.json").is_file()
+    assert not (session / "events" / "undeliverable" / "event-late.json").exists()
+    assert dispatcher.wait_for_event(session, timeout_seconds=0.05) is None
+
+
+def test_active_waiter_keeps_route_less_event_pending(tmp_path):
+    session = _routeless_session(tmp_path)
+    bridge.enqueue_event(
+        session, kind="completed", message="done", event_id="event-held"
+    )
+    marker = bridge.register_event_waiter(session)
+    try:
+        dispatcher = events.EventDispatcher(
+            capture_route=lambda **_kwargs: {},
+            publish=lambda **_kwargs: {"ok": True},
+            reconcile_seconds=60,
+        )
+        assert dispatcher.drain_once() == 0
+        assert bridge.list_pending_events()[0][1]["event_id"] == "event-held"
+    finally:
+        bridge.unregister_event_waiter(marker)
 
 
 def test_dispatcher_keeps_event_pending_when_host_rejects_it(tmp_path):
@@ -608,14 +912,14 @@ def test_claude_session_wait_rejects_invalid_timeouts(tmp_path, timeout):
                 "hook_event_name": "Notification",
                 "notification_type": "agent_needs_input",
             },
-            "needs_input",
+            None,
         ),
         (
             {
                 "hook_event_name": "Notification",
                 "notification_type": "agent_completed",
             },
-            "completed",
+            None,
         ),
         (
             {"hook_event_name": "Notification", "notification_type": "unknown"},

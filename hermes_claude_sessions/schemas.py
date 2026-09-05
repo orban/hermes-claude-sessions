@@ -14,7 +14,9 @@ CLAUDE_SESSION_START: dict[str, object] = {
         "Start one native Claude background session. Auto mode is the unattended "
         "default: Claude's classifier decides routine actions and residual permission "
         "requests are routed back to Hermes. Accepts per-task model and reasoning "
-        "effort routing."
+        "effort routing. The result's `wake` field says whether completion can wake "
+        "this session: `routable` (end the turn; Hermes re-enters on completion) or "
+        "`none` (no return address: call claude_session_wait before ending the turn)."
     ),
     "parameters": {
         "type": "object",
@@ -53,8 +55,27 @@ CLAUDE_SESSION_START: dict[str, object] = {
 
 CLAUDE_SESSION_LIST: dict[str, object] = {
     "name": "claude_session_list",
-    "description": "Read-only list of native Claude background sessions.",
-    "parameters": {"type": "object", "properties": {}},
+    "description": (
+        "Read-only bounded list of native Claude background sessions. Filter by exact "
+        "session ID when the native registry is large."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "id": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{8}$",
+                "description": "Optional exact native session ID to return.",
+            },
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100,
+                "default": 20,
+                "description": "Maximum session rows to return.",
+            },
+        },
+    },
 }
 
 CLAUDE_PERMISSION_LIST: dict[str, object] = {

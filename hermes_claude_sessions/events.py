@@ -18,6 +18,7 @@ from . import bridge
 
 CaptureRoute = Callable[..., Mapping[str, Any]]
 PublishEvent = Callable[..., Mapping[str, Any]]
+ReconcileLifecycle = Callable[[], object]
 
 
 class EventDispatcher:
@@ -28,18 +29,22 @@ class EventDispatcher:
         *,
         capture_route: CaptureRoute | None = None,
         publish: PublishEvent | None = None,
+        reconcile_lifecycle: ReconcileLifecycle | None = None,
         reconcile_seconds: float = 30.0,
     ) -> None:
         self._capture_route = capture_route
         self._publish = publish
+        self._reconcile_lifecycle = reconcile_lifecycle
         self._reconcile_seconds = max(1.0, reconcile_seconds)
         self._socket: socket.socket | None = None
         self._socket_path = ""
         self._thread: threading.Thread | None = None
         self._state_thread: threading.Thread | None = None
+        self._lifecycle_thread: threading.Thread | None = None
         self._state_reader: socket.socket | None = None
         self._state_writer: socket.socket | None = None
         self._stop = threading.Event()
+        self._lifecycle_wakeup = threading.Event()
         self._lock = threading.RLock()
         self._condition = threading.Condition(self._lock)
         self._waiters: dict[str, int] = {}
@@ -58,6 +63,45 @@ class EventDispatcher:
         with self._lock:
             self._capture_route = capture_route
             self._publish = publish
+
+    def configure_lifecycle(self, reconcile: ReconcileLifecycle) -> None:
+        with self._lock:
+            self._reconcile_lifecycle = reconcile
+            if self._thread is not None and self._thread.is_alive():
+                self._start_lifecycle_thread_locked()
+
+    def _start_lifecycle_thread_locked(self) -> None:
+        if self._reconcile_lifecycle is None:
+            return
+        if self._lifecycle_thread is not None and self._lifecycle_thread.is_alive():
+            return
+        self._lifecycle_thread = threading.Thread(
+            target=self._run_lifecycle,
+            name="claude-session-lifecycle-reconciler",
+            daemon=True,
+        )
+        self._lifecycle_thread.start()
+
+    def _run_lifecycle_once(self) -> None:
+        reconcile = self._reconcile_lifecycle
+        if reconcile is None:
+            return
+        try:
+            reconcile()
+        except Exception:
+            return
+
+    def _run_lifecycle(self) -> None:
+        while not self._stop.is_set():
+            self._lifecycle_wakeup.wait(timeout=self._reconcile_seconds)
+            self._lifecycle_wakeup.clear()
+            if self._stop.is_set():
+                return
+            self._run_lifecycle_once()
+
+    def _reconcile_native_state(self) -> None:
+        bridge.enqueue_native_terminal_events()
+        self._lifecycle_wakeup.set()
 
     def capture_route(self, *, parent_session_id: str = "") -> dict[str, Any]:
         callback = self._capture_route
@@ -114,7 +158,8 @@ class EventDispatcher:
                     daemon=True,
                 )
                 self._state_thread.start()
-        bridge.enqueue_native_terminal_events()
+            self._start_lifecycle_thread_locked()
+        self._reconcile_native_state()
         self.drain_once()
         return self._socket_path
 
@@ -125,11 +170,13 @@ class EventDispatcher:
             listener = self._socket
             thread = self._thread
             state_thread = self._state_thread
+            lifecycle_thread = self._lifecycle_thread
             state_reader = self._state_reader
             state_writer = self._state_writer
             self._socket = None
             self._thread = None
             self._state_thread = None
+            self._lifecycle_thread = None
             self._state_reader = None
             self._state_writer = None
             socket_path = self._socket_path
@@ -146,10 +193,16 @@ class EventDispatcher:
         if state_writer is not None:
             with suppress(OSError):
                 state_writer.send(b"stop")
+        self._lifecycle_wakeup.set()
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=1.0)
         if state_thread is not None and state_thread is not threading.current_thread():
             state_thread.join(timeout=1.0)
+        if (
+            lifecycle_thread is not None
+            and lifecycle_thread is not threading.current_thread()
+        ):
+            lifecycle_thread.join(timeout=1.0)
         if listener is not None:
             with suppress(OSError):
                 listener.close()
@@ -174,7 +227,7 @@ class EventDispatcher:
                     return
             if self._stop.is_set():
                 return
-            bridge.enqueue_native_terminal_events()
+            self._reconcile_native_state()
             with self._condition:
                 self._condition.notify_all()
             self.drain_once()
@@ -182,7 +235,7 @@ class EventDispatcher:
     def watch_session(self, session: Path) -> None:
         """Arm native-state delivery after Claude returns the managed short ID."""
         del session
-        bridge.enqueue_native_terminal_events()
+        self._reconcile_native_state()
         writer = self._state_writer
         if writer is not None:
             with suppress(OSError):
@@ -272,7 +325,7 @@ class EventDispatcher:
             )
             while not self._stop.is_set():
                 self._refresh_state_watches(watcher, watched)
-                bridge.enqueue_native_terminal_events()
+                self._reconcile_native_state()
                 native_events = watcher.control(
                     None,
                     max(1, len(watched) + 1),
@@ -283,7 +336,7 @@ class EventDispatcher:
                 if any(event.ident == reader.fileno() for event in native_events):
                     with suppress(BlockingIOError, OSError):
                         reader.recv(4096)
-                bridge.enqueue_native_terminal_events()
+                self._reconcile_native_state()
         finally:
             for descriptor in watched.values():
                 with suppress(OSError):
@@ -316,6 +369,12 @@ class EventDispatcher:
             try:
                 while not self._stop.is_set():
                     claim = bridge.claim_next_event(session, consumer="wait")
+                    if claim is None:
+                        # A dead-lettered (unroutable) event is still this session's own
+                        # outcome; the tool path is its only consumer.
+                        claim = bridge.claim_next_event(
+                            session, consumer="wait", source="undeliverable"
+                        )
                     if claim is not None:
                         if bridge.complete_event_claim(claim, disposition="consumed"):
                             return claim.event
@@ -338,6 +397,18 @@ class EventDispatcher:
             self.drain_once()
         return None
 
+    @staticmethod
+    def _settle_publish_failure(claim: bridge.EventClaim, error: str) -> None:
+        """Retry a failed publish a bounded number of times, then dead-letter it."""
+        attempts = bridge.note_publish_failure(claim, error)
+        if attempts >= bridge.MAX_PUBLISH_ATTEMPTS:
+            bridge.dead_letter_event_claim(
+                claim,
+                reason=f"publish failed {attempts} times; last error: {error}",
+            )
+            return
+        bridge.release_event_claim(claim)
+
     def drain_once(self) -> int:
         """Transfer pending spool records into Hermes's durable wake ledger."""
         publisher = self._publish
@@ -356,20 +427,32 @@ class EventDispatcher:
                 bridge.release_event_claim(claim)
                 continue
             event = claim.event
+            route = dict(event.get("route") or {})
+            if not bridge.route_is_deliverable(route):
+                # No return address (CLI / kanban / pre-API launch): the host would
+                # reject it on every retry. Dead-letter now; a same-session waiter can
+                # still consume it.
+                bridge.dead_letter_event_claim(
+                    claim, reason="route has no routable session identity"
+                )
+                continue
             try:
                 result = publisher(
                     event_id=event_id,
                     kind=str(event.get("kind") or "event"),
                     message=str(event.get("message") or ""),
-                    route=dict(event.get("route") or {}),
+                    route=route,
                     producer_id=str(event.get("producer_id") or ""),
                     payload=dict(event.get("payload") or {}),
                 )
-            except Exception:
-                bridge.release_event_claim(claim)
+            except Exception as exc:
+                self._settle_publish_failure(claim, f"{type(exc).__name__}: {exc}")
                 continue
             if not isinstance(result, Mapping) or not result.get("ok"):
-                bridge.release_event_claim(claim)
+                error = result.get("error") if isinstance(result, Mapping) else None
+                self._settle_publish_failure(
+                    claim, str(error or "host rejected the event")
+                )
                 continue
             if bridge.complete_event_claim(claim, disposition="published"):
                 published += 1
@@ -379,6 +462,10 @@ class EventDispatcher:
 
 
 _dispatcher = EventDispatcher()
+
+
+def configure_lifecycle(reconcile: ReconcileLifecycle) -> None:
+    _dispatcher.configure_lifecycle(reconcile)
 
 
 def configure_context(context: object) -> bool:
