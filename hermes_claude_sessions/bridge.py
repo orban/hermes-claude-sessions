@@ -324,8 +324,18 @@ def remove_session(session: Path) -> None:
         if record is not None and record.get("session_uuid") == session.name:
             binding.unlink(missing_ok=True)
             _fsync_directory(binding.parent)
-    shutil.rmtree(session, ignore_errors=True)
-    _fsync_directory(state_root())
+    root = state_root()
+    # Rename first so a crash mid-rmtree leaves a `.tmp` sibling (excluded by
+    # managed_session_directories and swept later) rather than a half-deleted
+    # session that the next tick would treat as real.
+    temporary = root / f".{session.name}.{uuid.uuid4().hex}.tmp"
+    try:
+        os.replace(session, temporary)
+    except OSError:
+        temporary = session
+    _fsync_directory(root)
+    shutil.rmtree(temporary, ignore_errors=True)
+    _fsync_directory(root)
 
 
 def native_job_state_path(

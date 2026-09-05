@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -26,6 +28,17 @@ def _managed_terminal_session(
         lambda _run, _claude_bin, _native_id: (True, state),
     )
     return session
+
+
+def _native_state_path(session: Path) -> Path:
+    metadata = json.loads((session / "metadata.json").read_text())
+    return Path(metadata["native_state_path"])
+
+
+def _age_native_record(session: Path, mtime: float) -> None:
+    """Pin the native state record's mtime so a fake clock can order it against
+    a snapshot's captured_at."""
+    os.utime(_native_state_path(session), (mtime, mtime))
 
 
 def _publish_terminal_event(session: Path) -> None:
@@ -109,6 +122,7 @@ def test_reconcile_recovers_after_native_removal_before_status_commit(
             "captured_at": 900.0,
         },
     )
+    _age_native_record(session, 800.0)
     calls: list[list[str]] = []
     roster = iter(((True, "failed"), (False, "")))
     monkeypatch.setattr(
@@ -1087,3 +1101,447 @@ def test_undeliverable_terminal_event_counts_as_settled_for_retirement(
 
     assert lifecycle._terminal_event_delivered(session) is True
     assert bridge.list_pending_events() == []
+
+
+def _blocked_then_unblocked_rm(
+    outputs: dict[str, str], rm_results: list[int]
+) -> tuple[list[list[str]], object]:
+    calls: list[list[str]] = []
+
+    def run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        del kwargs
+        calls.append(argv)
+        if argv[1] == "logs":
+            return subprocess.CompletedProcess(argv, 0, outputs["logs"], "")
+        if argv[1] == "rm":
+            returncode = rm_results.pop(0)
+            return subprocess.CompletedProcess(
+                argv, returncode, "kept a1b2c3d4 — worktree" if returncode else "", ""
+            )
+        return subprocess.CompletedProcess(
+            argv, 0, json.dumps([{"id": "a1b2c3d4", "state": "done"}]), ""
+        )
+
+    return calls, run
+
+
+def test_snapshot_is_recaptured_when_native_record_outlives_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    session = _managed_terminal_session(monkeypatch, tmp_path)
+    _publish_terminal_event(session)
+    _age_native_record(session, 900.0)
+    outputs = {"logs": "run-1 output"}
+    calls, run = _blocked_then_unblocked_rm(outputs, [1, 0])
+
+    first = lifecycle.reconcile_terminal_sessions(
+        "/mock/claude", run=run, now=lambda: 1000.0
+    )
+
+    assert first["protected"] == 1
+    assert lifecycle.read_snapshot(session)["stdout"] == "run-1 output"
+    retry_after = lifecycle.read_status(session)["retry_after"]
+
+    # The user resumed the idle job, it did more work, and its state record was
+    # rewritten after the archive was taken.
+    _age_native_record(session, retry_after + 10.0)
+    outputs["logs"] = "run-2 output"
+    calls.clear()
+
+    second = lifecycle.reconcile_terminal_sessions(
+        "/mock/claude", run=run, now=lambda: retry_after + 100.0
+    )
+
+    assert second["retired"] == 1
+    assert calls == [
+        ["/mock/claude", "logs", "a1b2c3d4"],
+        ["/mock/claude", "rm", "a1b2c3d4"],
+    ]
+    snapshot = lifecycle.read_snapshot(session)
+    assert snapshot["stdout"] == "run-2 output"
+    assert snapshot["captured_at"] == retry_after + 100.0
+    assert lifecycle.read_status(session)["state"] == "retired"
+
+
+def test_snapshot_is_trusted_while_native_record_is_unchanged(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    session = _managed_terminal_session(monkeypatch, tmp_path)
+    _publish_terminal_event(session)
+    _age_native_record(session, 900.0)
+    outputs = {"logs": "run-1 output"}
+    calls, run = _blocked_then_unblocked_rm(outputs, [1, 0])
+
+    first = lifecycle.reconcile_terminal_sessions(
+        "/mock/claude", run=run, now=lambda: 1000.0
+    )
+    assert first["protected"] == 1
+    retry_after = lifecycle.read_status(session)["retry_after"]
+    outputs["logs"] = "must not be requested"
+    calls.clear()
+
+    second = lifecycle.reconcile_terminal_sessions(
+        "/mock/claude", run=run, now=lambda: retry_after + 100.0
+    )
+
+    assert second["retired"] == 1
+    assert calls == [["/mock/claude", "rm", "a1b2c3d4"]]
+    assert lifecycle.read_snapshot(session)["stdout"] == "run-1 output"
+
+
+def test_rm_inflight_replay_recaptures_stale_snapshot_before_removal(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    session = _managed_terminal_session(monkeypatch, tmp_path)
+    lifecycle.write_snapshot(
+        session,
+        {
+            "version": 1,
+            "id": "a1b2c3d4",
+            "native_state": "done",
+            "returncode": 0,
+            "stdout": "archived before resume",
+            "stderr": "",
+            "captured_at": 900.0,
+        },
+    )
+    lifecycle.write_status(
+        session,
+        lifecycle._rm_inflight_status(
+            session, native_id="a1b2c3d4", native_state="done", now=900.0
+        ),
+    )
+    stale_status = lifecycle.read_status(session)
+    _age_native_record(session, 950.0)
+    calls: list[list[str]] = []
+
+    def run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        del kwargs
+        calls.append(argv)
+        if argv[1] == "logs":
+            return subprocess.CompletedProcess(argv, 0, "resumed output", "")
+        assert argv[1] == "rm"
+        status = lifecycle.read_status(session)
+        assert status["state"] == "rm_inflight"
+        assert status["snapshot_sha256"] == lifecycle._snapshot_sha256(session)
+        assert status["snapshot_sha256"] != stale_status["snapshot_sha256"]
+        assert status["attempt_id"] == stale_status["attempt_id"]
+        return subprocess.CompletedProcess(argv, 0, "removed", "")
+
+    result = lifecycle.reconcile_terminal_sessions(
+        "/mock/claude", run=run, now=lambda: 1000.0
+    )
+
+    assert result["retired"] == 1
+    assert calls == [
+        ["/mock/claude", "logs", "a1b2c3d4"],
+        ["/mock/claude", "rm", "a1b2c3d4"],
+    ]
+    assert lifecycle.read_snapshot(session)["stdout"] == "resumed output"
+    assert lifecycle.read_status(session)["state"] == "retired"
+
+
+def test_stale_snapshot_survives_when_native_job_vanished_before_recapture(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    session = _managed_terminal_session(monkeypatch, tmp_path)
+    _publish_terminal_event(session)
+    lifecycle.write_snapshot(
+        session,
+        {
+            "version": 1,
+            "id": "a1b2c3d4",
+            "native_state": "done",
+            "returncode": 0,
+            "stdout": "only surviving archive",
+            "stderr": "",
+            "captured_at": 900.0,
+        },
+    )
+    _age_native_record(session, 950.0)
+    roster = iter(((True, "done"), (False, "")))
+    monkeypatch.setattr(
+        lifecycle,
+        "_roster_state",
+        lambda _run, _claude_bin, _native_id: next(roster),
+    )
+
+    def run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        del kwargs
+        if argv[1] == "logs":
+            return subprocess.CompletedProcess(argv, 1, "", "no such session")
+        raise AssertionError(argv)
+
+    result = lifecycle.reconcile_terminal_sessions(
+        "/mock/claude", run=run, now=lambda: 1000.0
+    )
+
+    assert result["retired"] == 1
+    assert lifecycle.read_snapshot(session)["stdout"] == "only surviving archive"
+
+
+def test_remove_session_stages_directory_out_of_listing_before_deleting(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "managed"
+    monkeypatch.setattr(bridge, "state_root", lambda: root)
+    session = bridge.create_session("half-removed", tmp_path)
+    real_rmtree = bridge.shutil.rmtree
+    crashed: list[Path] = []
+
+    def interrupted_rmtree(path: object, *args: object, **kwargs: object) -> None:
+        if not crashed:
+            crashed.append(Path(str(path)))
+            return
+        real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(bridge.shutil, "rmtree", interrupted_rmtree)
+
+    bridge.remove_session(session)
+
+    assert not session.exists()
+    assert bridge.managed_session_directories() == []
+    leftovers = [
+        path for path in root.iterdir() if bridge._SESSION_TEMP.fullmatch(path.name)
+    ]
+    assert leftovers == crashed
+    assert leftovers[0].name.startswith(f".{session.name}.")
+    assert (leftovers[0] / "metadata.json").is_file()
+
+    swept = lifecycle.reconcile_terminal_sessions(
+        "/mock/claude",
+        run=lambda *args, **kwargs: pytest.fail("leftover ran native commands"),
+        now=lambda: time.time() + bridge.STALE_SESSION_TEMP_SECONDS + 1,
+    )
+
+    assert swept["observed"] == 0
+    assert not leftovers[0].exists()
+    assert list(root.iterdir()) == []
+
+
+def test_mark_launch_uncertain_keeps_a_binding_the_reconciler_established(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(bridge, "state_root", lambda: tmp_path / "managed")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    session = bridge.create_session("slow-launch", tmp_path)
+    metadata = json.loads((session / "metadata.json").read_text())
+    metadata["created_at"] = 1000.0
+    bridge._write_json_atomic(session / "metadata.json", metadata)
+    rows = [
+        {
+            "id": "a1b2c3d4",
+            "name": metadata["launch_name"],
+            "cwd": str(tmp_path),
+            "sessionId": "a1b2c3d4-0000-4000-8000-000000000000",
+            "startedAt": 1000_001,
+            "state": "working",
+        }
+    ]
+    recovered = lifecycle.reconcile_uncertain_launches(
+        "/mock/claude",
+        run=lambda argv, **kwargs: subprocess.CompletedProcess(
+            argv, 0, json.dumps(rows), ""
+        ),
+        now=lambda: 1000.0 + lifecycle.LAUNCH_INTENT_GRACE_SECONDS + 1,
+    )
+    assert recovered["recovered"] == 1
+
+    # The stalled tool thread reports its timeout after the reconciler bound it.
+    lifecycle.mark_launch_uncertain(
+        session, "launch command timed out", now=1032.0, returncode=None
+    )
+
+    metadata = json.loads((session / "metadata.json").read_text())
+    assert metadata["launch_state"] == "bound"
+    assert metadata["native_id"] == "a1b2c3d4"
+    assert metadata["launch_detail"] == "launch command timed out"
+    assert "launch_uncertain_at" not in metadata
+    assert bridge.find_session("a1b2c3d4") == session
+
+    state_path = _native_state_path(session)
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text(json.dumps({"state": "done"}), encoding="utf-8")
+    monkeypatch.setattr(
+        lifecycle, "_roster_state", lambda _run, _bin, _id: (True, "done")
+    )
+    # Deliver the launch-recovered wake first so the terminal one is next.
+    recovered_claim = bridge.claim_next_event(session, consumer="dispatcher")
+    assert recovered_claim is not None
+    assert recovered_claim.event_id == f"launch-recovered-{session.name}"
+    assert bridge.complete_event_claim(recovered_claim, disposition="published")
+    _publish_terminal_event(session)
+
+    def run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        del kwargs
+        assert argv[1] in {"logs", "rm"}
+        return subprocess.CompletedProcess(argv, 0, "output", "")
+
+    retired = lifecycle.reconcile_terminal_sessions(
+        "/mock/claude", run=run, now=lambda: 2000.0
+    )
+
+    assert retired["retired"] == 1
+    assert lifecycle.read_status(session)["state"] == "retired"
+
+
+def test_fresh_foreign_claim_defers_without_disturbing_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(bridge, "state_root", lambda: tmp_path / "managed")
+    session = bridge.create_session("claimed", tmp_path)
+    claim = session / "lifecycle-claim"
+    claim.mkdir()
+    (claim / "owner.json").write_text('{"pid": 1}', encoding="utf-8")
+    now = time.time()
+
+    with lifecycle._claim(session, lambda: now) as acquired:
+        assert acquired is False
+
+    assert claim.is_dir()
+    assert (claim / "owner.json").read_text(encoding="utf-8") == '{"pid": 1}'
+
+
+def test_stale_claim_is_taken_over_and_released(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(bridge, "state_root", lambda: tmp_path / "managed")
+    session = bridge.create_session("stale-claim", tmp_path)
+    claim = session / "lifecycle-claim"
+    claim.mkdir()
+    (claim / "owner.json").write_text('{"pid": 1}', encoding="utf-8")
+    later = time.time() + lifecycle.CLAIM_STALE_SECONDS + 1
+
+    with lifecycle._claim(session, lambda: later) as acquired:
+        assert acquired is True
+        owner = json.loads((claim / "owner.json").read_text(encoding="utf-8"))
+        assert owner == {"pid": os.getpid(), "claimed_at": later}
+
+    assert not claim.exists()
+
+
+def test_claim_is_released_when_the_guarded_block_raises(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(bridge, "state_root", lambda: tmp_path / "managed")
+    session = bridge.create_session("raising", tmp_path)
+    claim = session / "lifecycle-claim"
+
+    with (
+        pytest.raises(RuntimeError, match="snapshot exploded"),
+        lifecycle._claim(session, time.time) as acquired,
+    ):
+        assert acquired is True
+        assert claim.is_dir()
+        raise RuntimeError("snapshot exploded")
+
+    assert not claim.exists()
+    with lifecycle._claim(session, time.time) as acquired:
+        assert acquired is True
+
+
+def test_failed_launch_is_pruned_only_after_event_delivery_and_retention(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(bridge, "state_root", lambda: tmp_path / "managed")
+    session = bridge.create_session("never-launched", tmp_path)
+    lifecycle.mark_launch_uncertain(session, "nonzero launch", now=1000.0)
+    metadata = json.loads((session / "metadata.json").read_text())
+    metadata["created_at"] = 1000.0
+    bridge._write_json_atomic(session / "metadata.json", metadata)
+    after_window = 1000.0 + lifecycle.LAUNCH_RECONCILIATION_WINDOW_SECONDS + 1
+    lifecycle.reconcile_uncertain_launches(
+        "/mock/claude",
+        run=lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, "[]", ""),
+        now=lambda: after_window,
+    )
+    metadata = json.loads((session / "metadata.json").read_text())
+    assert metadata["launch_state"] == "failed"
+    failed_at = metadata["launch_failed_at"]
+    assert failed_at == after_window
+    after_retention = failed_at + lifecycle.RETIRED_STATE_RETENTION_SECONDS + 1
+    fail_run = lambda *args, **kwargs: pytest.fail("failed launch ran commands")  # noqa: E731
+
+    undelivered = lifecycle.reconcile_terminal_sessions(
+        "/mock/claude", run=fail_run, now=lambda: after_retention
+    )
+
+    assert undelivered["observed"] == 1
+    assert undelivered["pruned"] == 0
+    assert session.exists()
+    pending = bridge.list_pending_events()
+    assert [event["event_id"] for _session, event in pending] == [
+        f"launch-failed-{session.name}"
+    ]
+
+    claim = bridge.claim_next_event(session, consumer="dispatcher")
+    assert claim is not None
+    assert bridge.complete_event_claim(claim, disposition="published") is True
+
+    retained = lifecycle.reconcile_terminal_sessions(
+        "/mock/claude", run=fail_run, now=lambda: after_retention - 2
+    )
+
+    assert retained["pruned"] == 0
+    assert session.exists()
+
+    pruned = lifecycle.reconcile_terminal_sessions(
+        "/mock/claude", run=fail_run, now=lambda: after_retention
+    )
+
+    assert pruned["pruned"] == 1
+    assert not session.exists()
+
+
+def test_uncertain_launch_reports_native_id_ownership_collision(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(bridge, "state_root", lambda: tmp_path / "managed")
+    owner = bridge.create_session("owner", tmp_path)
+    bridge.set_native_id(owner, "a1b2c3d4")
+    binding = bridge.native_binding_path("a1b2c3d4")
+    binding_before = binding.read_bytes()
+    session = bridge.create_session("collide", tmp_path)
+    lifecycle.mark_launch_uncertain(session, "launch timeout", now=1000.0)
+    metadata = json.loads((session / "metadata.json").read_text())
+    metadata["created_at"] = 1000.0
+    bridge._write_json_atomic(session / "metadata.json", metadata)
+    rows = [
+        {
+            "id": "a1b2c3d4",
+            "name": metadata["launch_name"],
+            "cwd": str(tmp_path),
+            "sessionId": "a1b2c3d4-0000-4000-8000-000000000000",
+            "startedAt": 1000_001,
+            "state": "working",
+        }
+    ]
+    run = lambda argv, **kwargs: subprocess.CompletedProcess(  # noqa: E731
+        argv, 0, json.dumps(rows), ""
+    )
+    collision_detail = "native session id is already bound to another managed session"
+
+    early = lifecycle.reconcile_uncertain_launches(
+        "/mock/claude", run=run, now=lambda: 1001.0
+    )
+
+    assert early == {"observed": 1, "recovered": 0, "ambiguous": 1}
+    metadata = json.loads((session / "metadata.json").read_text())
+    assert metadata["launch_state"] == "ambiguous"
+    assert metadata["native_id"] is None
+    assert metadata["launch_detail"] == collision_detail
+    assert binding.read_bytes() == binding_before
+    assert bridge.find_session("a1b2c3d4") == owner
+
+    expired = lifecycle.reconcile_uncertain_launches(
+        "/mock/claude",
+        run=run,
+        now=lambda: 1000.0 + lifecycle.LAUNCH_RECONCILIATION_WINDOW_SECONDS + 1,
+    )
+
+    assert expired == {"observed": 1, "recovered": 0, "ambiguous": 0}
+    metadata = json.loads((session / "metadata.json").read_text())
+    assert metadata["launch_state"] == "failed"
+    assert metadata["launch_detail"] == collision_detail
+    assert binding.read_bytes() == binding_before
+    assert bridge.find_session("a1b2c3d4") == owner
