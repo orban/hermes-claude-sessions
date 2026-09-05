@@ -760,6 +760,50 @@ def test_ambiguous_launch_results_retain_reconcilable_intent(
         assert "work" not in json.dumps(metadata)
 
 
+def test_start_reports_ownership_collision_without_touching_existing_binding(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "state"
+    monkeypatch.setattr(bridge, "state_root", lambda: root)
+    monkeypatch.setattr(tools, "resolve_claude_bin", lambda: "/mock/claude")
+    owner = bridge.create_session("owner", tmp_path)
+    bridge.set_native_id(owner, "a1b2c3d4")
+    binding = bridge.native_binding_path("a1b2c3d4")
+    binding_before = binding.read_bytes()
+    monkeypatch.setattr(
+        tools.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0], 0, launch_stdout(args[0]), ""
+        ),
+    )
+
+    result = decode(
+        tools.claude_session_start(
+            {"name": "collide", "cwd": str(tmp_path), "prompt": "work"}
+        )
+    )
+
+    assert result["ok"] is False
+    assert result["error"] == (
+        "Claude managed launch could not establish exclusive ownership"
+    )
+    assert result["launch_state"] == "uncertain"
+    assert result["managed_session"] is True
+    assert "work" not in json.dumps(result)
+    sessions = sorted(path for path in root.iterdir() if path.is_dir())
+    assert len(sessions) == 2
+    (collided,) = [session for session in sessions if session != owner]
+    metadata = json.loads((collided / "metadata.json").read_text())
+    assert metadata["launch_state"] == "uncertain"
+    assert metadata["native_id"] is None
+    assert metadata["launch_detail"] == (
+        "native session id binding could not be established"
+    )
+    assert binding.read_bytes() == binding_before
+    assert bridge.find_session("a1b2c3d4") == owner
+
+
 def test_exec_failure_removes_unlaunched_intent(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

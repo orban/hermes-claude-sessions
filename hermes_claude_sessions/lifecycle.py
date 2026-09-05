@@ -141,11 +141,16 @@ def mark_launch_uncertain(
     metadata = bridge._read_json(metadata_path)
     if metadata is None:
         raise ValueError("managed session metadata is unavailable")
-    metadata["launch_state"] = "uncertain"
-    metadata["launch_uncertain_at"] = time.time() if now is None else now
     metadata["launch_detail"] = detail
     if returncode is not None:
         metadata["launch_returncode"] = returncode
+    already_bound = (
+        metadata.get("launch_state") == "bound"
+        and metadata.get("native_id") is not None
+    )
+    if not already_bound:
+        metadata["launch_state"] = "uncertain"
+        metadata["launch_uncertain_at"] = time.time() if now is None else now
     bridge._write_json_atomic(metadata_path, metadata)
 
 
@@ -185,6 +190,14 @@ def _launch_candidates(
             continue
         candidates.append(row)
     return candidates
+
+
+def _launch_failure_detail(candidates: list[dict[str, Any]], *, collision: bool) -> str:
+    if collision:
+        return "native session id is already bound to another managed session"
+    if len(candidates) > 1:
+        return "multiple matching native sessions"
+    return "no matching native session appeared"
 
 
 def reconcile_uncertain_launches(
@@ -236,12 +249,13 @@ def reconcile_uncertain_launches(
     for session, metadata, expired in uncertain:
         result["observed"] += 1
         candidates = _launch_candidates(metadata, rows)
+        collision = False
         if len(candidates) == 1:
             native_id = str(candidates[0]["id"])
             try:
                 bridge.set_native_id(session, native_id)
             except ValueError:
-                candidates.append(candidates[0])
+                collision = True
             else:
                 event_id = f"launch-recovered-{session.name}"
                 bridge.enqueue_event(
@@ -259,10 +273,8 @@ def reconcile_uncertain_launches(
                 continue
         if expired:
             metadata["launch_state"] = "failed"
-            metadata["launch_detail"] = (
-                "multiple matching native sessions"
-                if len(candidates) > 1
-                else "no matching native session appeared"
+            metadata["launch_detail"] = _launch_failure_detail(
+                candidates, collision=collision
             )
             metadata["launch_failed_at"] = current_time
             metadata["launch_updated_at"] = current_time
@@ -280,9 +292,11 @@ def reconcile_uncertain_launches(
             )
             bridge.signal_dispatcher(session)
             continue
-        if len(candidates) > 1:
+        if len(candidates) > 1 or collision:
             metadata["launch_state"] = "ambiguous"
-            metadata["launch_detail"] = "multiple matching native sessions"
+            metadata["launch_detail"] = _launch_failure_detail(
+                candidates, collision=collision
+            )
             metadata["launch_updated_at"] = current_time
             bridge._write_json_atomic(session / "metadata.json", metadata)
             result["ambiguous"] += 1
@@ -387,6 +401,32 @@ def _event_delivered(session: Path, event_id: str) -> bool:
     )
 
 
+def _native_record_mtime(session: Path) -> float | None:
+    metadata = bridge._read_json(session / "metadata.json")
+    if metadata is None:
+        return None
+    state_path = bridge._metadata_native_state_path(metadata)
+    if state_path is None:
+        return None
+    try:
+        return state_path.stat().st_mtime
+    except OSError:
+        return None
+
+
+def _snapshot_is_current(session: Path) -> bool:
+    """An archived snapshot is trusted only until the native job's state record
+    is rewritten after it: a resumed job produces logs the archive does not hold."""
+    snapshot = read_snapshot(session)
+    if snapshot is None:
+        return False
+    captured_at = snapshot.get("captured_at")
+    record_mtime = _native_record_mtime(session)
+    if record_mtime is None or not isinstance(captured_at, (int, float)):
+        return True
+    return record_mtime <= float(captured_at)
+
+
 def _capture_snapshot(
     session: Path,
     *,
@@ -396,7 +436,7 @@ def _capture_snapshot(
     run: RunCommand,
     now: float,
 ) -> bool:
-    if read_snapshot(session) is not None:
+    if _snapshot_is_current(session):
         return True
     completed = _run(run, [claude_bin, "logs", native_id])
     if completed is None or completed.returncode != 0:
@@ -444,6 +484,10 @@ def _has_prune_blocker(session: Path) -> bool:
     )
 
 
+def _snapshot_sha256(session: Path) -> str:
+    return hashlib.sha256(snapshot_path(session).read_bytes()).hexdigest()
+
+
 def _rm_inflight_status(
     session: Path,
     *,
@@ -451,7 +495,6 @@ def _rm_inflight_status(
     native_state: str,
     now: float,
 ) -> dict[str, Any]:
-    snapshot = snapshot_path(session).read_bytes()
     previous = read_status(session) or {}
     attempt_id = (
         previous.get("attempt_id")
@@ -464,7 +507,7 @@ def _rm_inflight_status(
         "state": "rm_inflight",
         "native_id": native_id,
         "native_state": native_state,
-        "snapshot_sha256": hashlib.sha256(snapshot).hexdigest(),
+        "snapshot_sha256": _snapshot_sha256(session),
         "attempt_id": attempt_id or uuid.uuid4().hex,
         "updated_at": now,
         "retirement_attempts": previous.get("retirement_attempts", 0),
@@ -486,6 +529,37 @@ def _replay_rm_inflight(
         return "retired"
     if present is None or roster_state not in _TERMINAL_STATES:
         return "deferred"
+    if not _snapshot_is_current(session):
+        native_state = roster_state
+        if not _capture_snapshot(
+            session,
+            native_id=native_id,
+            native_state=native_state,
+            claude_bin=claude_bin,
+            run=run,
+            now=now,
+        ):
+            write_status(
+                session,
+                _blocked_status(
+                    session,
+                    native_state,
+                    now,
+                    "terminal logs are not yet available",
+                ),
+            )
+            return "deferred"
+    status = read_status(session) or {}
+    if status.get("snapshot_sha256") != _snapshot_sha256(session):
+        write_status(
+            session,
+            _rm_inflight_status(
+                session,
+                native_id=native_id,
+                native_state=native_state,
+                now=now,
+            ),
+        )
     removed = _run(run, [claude_bin, "rm", native_id])
     if removed is not None and removed.returncode == 0:
         write_status(session, _retired_status(session, native_state, now))
@@ -533,6 +607,7 @@ def reconcile_terminal_sessions(
         root = bridge.state_root()
         if not root.is_dir():
             return result
+        bridge._sweep_stale_session_temps(root, now=now())
         for session in bridge.managed_session_directories():
             current_time = now()
             status = read_status(session)
@@ -675,21 +750,22 @@ def reconcile_terminal_sessions(
                 ):
                     present = _roster_contains(run, claude_bin, native_id)
                     if present is False:
-                        write_snapshot(
-                            session,
-                            {
-                                "version": 1,
-                                "id": native_id,
-                                "native_state": native_state,
-                                "returncode": 1,
-                                "stdout": "",
-                                "stderr": (
-                                    "native session disappeared before logs were "
-                                    "archived"
-                                ),
-                                "captured_at": current_time,
-                            },
-                        )
+                        if read_snapshot(session) is None:
+                            write_snapshot(
+                                session,
+                                {
+                                    "version": 1,
+                                    "id": native_id,
+                                    "native_state": native_state,
+                                    "returncode": 1,
+                                    "stdout": "",
+                                    "stderr": (
+                                        "native session disappeared before logs "
+                                        "were archived"
+                                    ),
+                                    "captured_at": current_time,
+                                },
+                            )
                         write_status(
                             session,
                             _rm_inflight_status(
