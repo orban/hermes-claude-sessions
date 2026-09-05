@@ -669,7 +669,7 @@ def claude_session_wait(args: object, **kwargs: object) -> str:
         {
             "ok": True,
             "id": native_id,
-            "status": "event",
+            "status": "ended" if event.get("already_delivered") else "event",
             "event": model_event,
         },
         "Claude session event is too large to return safely",

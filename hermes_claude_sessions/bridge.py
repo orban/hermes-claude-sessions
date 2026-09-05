@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import socket
+import sys
 import time
 import uuid
 from collections.abc import Mapping
@@ -189,6 +190,17 @@ def _read_json(path: Path) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
+def host_role() -> str:
+    """Which kind of Hermes process this is: ``gateway`` or ``cli``.
+
+    Recorded in session metadata so that, after the owning process dies, only a
+    process of the same kind adopts its spool events (a restarted gateway takes
+    over gateway-launched sessions; an interactive CLI never does)."""
+    if "gateway.run" in sys.modules or "gateway" in sys.argv:
+        return "gateway"
+    return "cli"
+
+
 def create_session(
     name: str,
     cwd: Path,
@@ -237,6 +249,7 @@ def create_session(
                 "launch_name": f"{name}-{launch_id[:8]}",
                 "route": dict(route or {}),
                 "event_socket": event_socket,
+                "owner": {"pid": os.getpid(), "role": host_role()},
                 "created_at": time.time(),
             },
         )

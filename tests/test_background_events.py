@@ -7,8 +7,10 @@ import select
 import shutil
 import socket
 import subprocess
+import sys
 import threading
 import time
+import types
 import uuid
 from pathlib import Path
 
@@ -1288,3 +1290,310 @@ def test_configure_context_registers_cleanup_and_starts_once(tmp_path):
         assert len(cleanups) == 2
     finally:
         events._dispatcher.stop()
+
+
+# --- spool ownership: only the launching process (or its same-role successor)
+# --- publishes a session's wakes, because a wake lands on the publisher's queue.
+
+
+def _recording_dispatcher(
+    published: list[dict[str, object]],
+) -> events.EventDispatcher:
+    return events.EventDispatcher(
+        capture_route=lambda **_kwargs: {},
+        publish=lambda **kwargs: published.append(dict(kwargs)) or {"ok": True},
+        reconcile_seconds=60,
+    )
+
+
+def _set_owner(session: Path, owner: object) -> None:
+    metadata = json.loads((session / "metadata.json").read_text())
+    if owner is None:
+        metadata.pop("owner", None)
+    else:
+        metadata["owner"] = owner
+    bridge._write_json_atomic(session / "metadata.json", metadata)
+
+
+def _enqueue_wake(session: Path, event_id: str = "event-owned") -> None:
+    bridge.enqueue_event(
+        session, kind="completed", message="Claude finished", event_id=event_id
+    )
+
+
+def test_create_session_records_owning_pid_and_cli_role(tmp_path, monkeypatch):
+    monkeypatch.delitem(sys.modules, "gateway.run", raising=False)
+    monkeypatch.setattr(sys, "argv", ["hermes", "chat"])
+
+    session = _session(tmp_path)
+
+    metadata = json.loads((session / "metadata.json").read_text())
+    assert metadata["owner"] == {"pid": os.getpid(), "role": "cli"}
+
+
+@pytest.mark.parametrize("marker", ["module", "argv"])
+def test_create_session_records_gateway_role_for_gateway_hosts(
+    tmp_path, monkeypatch, marker
+):
+    if marker == "module":
+        monkeypatch.setitem(sys.modules, "gateway.run", types.ModuleType("run"))
+        monkeypatch.setattr(sys, "argv", ["hermes"])
+    else:
+        monkeypatch.delitem(sys.modules, "gateway.run", raising=False)
+        monkeypatch.setattr(sys, "argv", ["hermes", "gateway", "run"])
+
+    session = _session(tmp_path)
+
+    metadata = json.loads((session / "metadata.json").read_text())
+    assert metadata["owner"] == {"pid": os.getpid(), "role": "gateway"}
+
+
+def test_dispatcher_publishes_events_of_sessions_it_owns(tmp_path, monkeypatch):
+    session = _session(tmp_path)
+    _enqueue_wake(session)
+    # Neither liveness nor role may matter for the owning process itself.
+    monkeypatch.setattr(bridge, "_pid_is_alive", lambda _pid: False)
+    monkeypatch.setattr(bridge, "host_role", lambda: "other-role")
+    published: list[dict[str, object]] = []
+
+    assert _recording_dispatcher(published).drain_once() == 1
+    assert [event["event_id"] for event in published] == ["event-owned"]
+    assert bridge.list_pending_events() == []
+
+
+def test_dispatcher_skips_sessions_owned_by_a_live_foreign_process(
+    tmp_path, monkeypatch
+):
+    session = _session(tmp_path)
+    _enqueue_wake(session)
+    _set_owner(session, {"pid": 4_000_001, "role": bridge.host_role()})
+    monkeypatch.setattr(bridge, "_pid_is_alive", lambda pid: pid == 4_000_001)
+    published: list[dict[str, object]] = []
+
+    assert _recording_dispatcher(published).drain_once() == 0
+    assert published == []
+    assert (session / "events" / "pending" / "event-owned.json").is_file()
+    assert not list((session / "events" / "claimed").glob("claim-*.json"))
+
+
+@pytest.mark.parametrize(
+    ("owner_role", "host_role", "expected_published"),
+    [
+        ("gateway", "gateway", 1),
+        ("cli", "cli", 1),
+        ("gateway", "cli", 0),
+        ("cli", "gateway", 0),
+    ],
+)
+def test_dispatcher_adopts_dead_owner_sessions_only_with_matching_role(
+    tmp_path, monkeypatch, owner_role, host_role, expected_published
+):
+    session = _session(tmp_path)
+    _enqueue_wake(session)
+    _set_owner(session, {"pid": 4_000_001, "role": owner_role})
+    monkeypatch.setattr(bridge, "_pid_is_alive", lambda _pid: False)
+    monkeypatch.setattr(bridge, "host_role", lambda: host_role)
+    published: list[dict[str, object]] = []
+
+    assert _recording_dispatcher(published).drain_once() == expected_published
+    assert len(published) == expected_published
+    assert len(bridge.list_pending_events()) == 1 - expected_published
+
+
+@pytest.mark.parametrize("owner", [None, "legacy", {"role": "cli"}, {"pid": True}])
+def test_dispatcher_publishes_sessions_without_a_usable_owner_record(
+    tmp_path, monkeypatch, owner
+):
+    session = _session(tmp_path)
+    _enqueue_wake(session)
+    _set_owner(session, owner)
+    monkeypatch.setattr(bridge, "_pid_is_alive", lambda _pid: True)
+    published: list[dict[str, object]] = []
+
+    assert _recording_dispatcher(published).drain_once() == 1
+    assert [event["event_id"] for event in published] == ["event-owned"]
+
+
+# --- wait on a settled session returns at once instead of sleeping to timeout.
+
+
+def _terminal_event_id(session: Path) -> str:
+    return f"terminal-{session.name}"
+
+
+def test_wait_returns_published_terminal_event_immediately(tmp_path):
+    session = _session(tmp_path)
+    _enqueue_wake(session, _terminal_event_id(session))
+    published: list[dict[str, object]] = []
+    dispatcher = _recording_dispatcher(published)
+    assert dispatcher.drain_once() == 1
+
+    started = time.monotonic()
+    event = dispatcher.wait_for_event(session, timeout_seconds=30)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 2
+    assert event is not None
+    assert event["event_id"] == _terminal_event_id(session)
+    assert event["kind"] == "completed"
+    assert event["already_delivered"] is True
+    assert (
+        session / "events" / "published" / f"{_terminal_event_id(session)}.json"
+    ).is_file()
+    assert len(published) == 1
+
+
+def test_wait_returns_consumed_terminal_event_immediately_on_second_wait(tmp_path):
+    session = _routeless_session(tmp_path)
+    _enqueue_wake(session, _terminal_event_id(session))
+    dispatcher = _recording_dispatcher([])
+
+    first = dispatcher.wait_for_event(session, timeout_seconds=1)
+    assert first is not None
+    assert "already_delivered" not in first
+    assert (
+        session / "events" / "consumed" / f"{_terminal_event_id(session)}.json"
+    ).is_file()
+
+    started = time.monotonic()
+    second = dispatcher.wait_for_event(session, timeout_seconds=30)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 2
+    assert second is not None
+    assert second["event_id"] == _terminal_event_id(session)
+    assert second["already_delivered"] is True
+    assert dispatcher.waiter_count(session) == 0
+    assert bridge.has_active_event_waiter(session) is False
+
+
+def test_wait_prefers_a_fresh_event_over_the_settled_terminal_record(tmp_path):
+    session = _session(tmp_path)
+    _enqueue_wake(session, _terminal_event_id(session))
+    dispatcher = _recording_dispatcher([])
+    assert dispatcher.drain_once() == 1
+    _enqueue_wake(session, "event-after-terminal")
+
+    event = dispatcher.wait_for_event(session, timeout_seconds=1)
+
+    assert event is not None
+    assert event["event_id"] == "event-after-terminal"
+    assert "already_delivered" not in event
+
+
+def test_wait_still_times_out_while_terminal_event_is_only_pending(tmp_path):
+    session = _session(tmp_path)
+    _enqueue_wake(session, _terminal_event_id(session))
+    marker = bridge.register_event_waiter(session)
+    try:
+        # A foreign waiter holds the event pending; nothing has settled yet, so a
+        # dispatcher-side wait that loses the claim race must not report "ended".
+        dispatcher = _recording_dispatcher([])
+        claim = bridge.claim_next_event(session, consumer="other-waiter")
+        assert claim is not None
+        assert dispatcher.wait_for_event(session, timeout_seconds=0.05) is None
+    finally:
+        bridge.unregister_event_waiter(marker)
+
+
+def test_claude_session_wait_reports_ended_after_terminal_delivery(
+    tmp_path, monkeypatch
+):
+    session = _session(tmp_path)
+    bridge.set_native_id(session, "a1b2c3d4")
+    bridge.enqueue_event(
+        session,
+        kind="completed",
+        message="Claude completed.",
+        event_id=_terminal_event_id(session),
+        payload={"notification_type": "agent_completed"},
+    )
+    # Real spool, real dispatcher: earlier tests may have stopped the module-level
+    # one, so the tool path gets a fresh instance to wait on.
+    dispatcher = _recording_dispatcher([])
+    monkeypatch.setattr(events, "_dispatcher", dispatcher)
+    assert dispatcher.drain_once() == 1
+
+    started = time.monotonic()
+    result = json.loads(
+        tools.claude_session_wait({"id": "a1b2c3d4", "timeout_seconds": 30})
+    )
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 2
+    assert result == {
+        "ok": True,
+        "id": "a1b2c3d4",
+        "status": "ended",
+        "event": {
+            "event_id": _terminal_event_id(session),
+            "kind": "completed",
+            "message": "Claude completed.",
+            "payload": {"notification_type": "agent_completed"},
+            "created_at": result["event"]["created_at"],
+        },
+    }
+
+
+# --- post-timeout drain: an event landing after the waiter's final poll is
+# --- published by the wait itself rather than left pending until the next tick.
+
+
+def test_timed_out_wait_publishes_event_that_landed_after_final_poll(
+    tmp_path, monkeypatch
+):
+    session = _session(tmp_path)
+    published: list[dict[str, object]] = []
+    dispatcher = _recording_dispatcher(published)
+    original_claim_next = bridge.claim_next_event
+    calls: list[str] = []
+
+    def claim_then_late_arrival(*args, **kwargs):
+        calls.append(str(kwargs.get("source", "pending")))
+        # The sole iteration (timeout 0) polls pending, then undeliverable; the
+        # event lands right after that second, final poll.
+        if len(calls) == 2:
+            _enqueue_wake(session, "event-late-arrival")
+            return None
+        return original_claim_next(*args, **kwargs)
+
+    monkeypatch.setattr(bridge, "claim_next_event", claim_then_late_arrival)
+
+    assert dispatcher.wait_for_event(session, timeout_seconds=0) is None
+
+    assert calls == ["pending", "undeliverable"]
+    assert bridge.has_active_event_waiter(session) is False
+    assert dispatcher.waiter_count(session) == 0
+    assert bridge.list_pending_events() == []
+    assert (session / "events" / "published" / "event-late-arrival.json").is_file()
+    assert [event["event_id"] for event in published] == ["event-late-arrival"]
+
+
+def test_stop_mid_wait_returns_promptly_and_unregisters_waiter(tmp_path):
+    session = _session(tmp_path)
+    dispatcher = _recording_dispatcher([])
+    results: list[object] = []
+    waiter = threading.Thread(
+        target=lambda: results.append(
+            dispatcher.wait_for_event(session, timeout_seconds=5)
+        )
+    )
+    waiter.start()
+    try:
+        deadline = time.monotonic() + 2
+        while dispatcher.waiter_count(session) == 0 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert dispatcher.waiter_count(session) == 1
+
+        started = time.monotonic()
+        dispatcher.stop()
+        waiter.join(timeout=2)
+        elapsed = time.monotonic() - started
+    finally:
+        waiter.join(timeout=1)
+
+    assert not waiter.is_alive()
+    assert elapsed < 1.5
+    assert results == [None]
+    assert dispatcher.waiter_count(session) == 0
+    assert bridge.has_active_event_waiter(session) is False
