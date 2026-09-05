@@ -965,8 +965,21 @@ def enqueue_request(session: Path, hook_input: dict[str, Any]) -> dict[str, Any]
     if metadata is None:
         raise ValueError("managed session metadata is unavailable")
     encoded = json.dumps(hook_input, ensure_ascii=False).encode("utf-8")
+    tool_input: Any = hook_input.get("tool_input")
     if len(encoded) > MAX_REQUEST_BYTES:
-        raise ValueError("permission request exceeds the managed size limit")
+        # Too large to relay verbatim. Replace it with a small marker instead
+        # of raising, so the request is still recorded and Hermes can see and
+        # deny it through the normal decision path (see docs/managed-permissions.md).
+        tool_input_bytes = len(
+            json.dumps(tool_input, ensure_ascii=False).encode("utf-8")
+        )
+        omitted: dict[str, Any] = {
+            "tool_input_omitted": True,
+            "tool_input_bytes": tool_input_bytes,
+        }
+        if isinstance(tool_input, Mapping):
+            omitted["tool_input_keys"] = sorted(str(key) for key in tool_input)[:20]
+        tool_input = omitted
     request = {
         "request_id": uuid.uuid4().hex,
         "created_at": time.time(),
@@ -979,9 +992,14 @@ def enqueue_request(session: Path, hook_input: dict[str, Any]) -> dict[str, Any]
         "cwd": hook_input.get("cwd"),
         "permission_mode": hook_input.get("permission_mode"),
         "tool_name": hook_input.get("tool_name"),
-        "tool_input": hook_input.get("tool_input"),
+        "tool_input": tool_input,
         "permission_suggestions": hook_input.get("permission_suggestions", []),
     }
+    encoded_request = json.dumps(request, ensure_ascii=False).encode("utf-8")
+    if len(encoded_request) > MAX_REQUEST_BYTES:
+        # A field other than tool_input (e.g. permission_suggestions) is
+        # itself oversized. Drop it too rather than fail closed with no trace.
+        request["permission_suggestions"] = []
     _write_json_atomic(session / "requests" / f"{request['request_id']}.json", request)
     return request
 

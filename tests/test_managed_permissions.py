@@ -477,8 +477,16 @@ def test_bridge_bounds_requests_and_validates_one_shot_decisions(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     session = prepare_session(monkeypatch, tmp_path)
-    with pytest.raises(ValueError, match="size limit"):
-        bridge.enqueue_request(session, {"tool_input": "x" * bridge.MAX_REQUEST_BYTES})
+    oversized = bridge.enqueue_request(
+        session,
+        {
+            "tool_name": "Write",
+            "tool_input": {"content": "x" * bridge.MAX_REQUEST_BYTES},
+        },
+    )
+    assert oversized["tool_input"]["tool_input_omitted"] is True
+    assert oversized["tool_input"]["tool_input_bytes"] > bridge.MAX_REQUEST_BYTES
+    assert oversized["tool_input"]["tool_input_keys"] == ["content"]
 
     assert not bridge.decide("bad", "allow", "reason")["ok"]
     request = bridge.enqueue_request(
@@ -497,6 +505,68 @@ def test_bridge_bounds_requests_and_validates_one_shot_decisions(
     exclusive = tmp_path / "exclusive.json"
     assert bridge._write_json_exclusive(exclusive, {"value": 1})
     assert not bridge._write_json_exclusive(exclusive, {"value": 2})
+
+
+def test_oversized_permission_request_is_recorded_and_denied_not_dropped(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An oversized tool_input must still leave an audit trail (finding 13):
+    a listed request and a permission_required event, instead of failing
+    closed with no trace before bridge.enqueue_request ever writes anything.
+    """
+    session = prepare_session(monkeypatch, tmp_path)
+    hook_input = {
+        "session_id": "native-uuid",
+        "cwd": str(tmp_path / "repo"),
+        "permission_mode": "auto",
+        "hook_event_name": "PermissionRequest",
+        "tool_name": "Write",
+        "tool_input": {"file_path": "big.lock", "content": "x" * (200 * 1024)},
+    }
+    output = StringIO()
+    errors: list[BaseException] = []
+
+    def invoke() -> None:
+        try:
+            permission_hook.run(
+                stdin=StringIO(json.dumps(hook_input)),
+                stdout=output,
+                environ={
+                    bridge.SESSION_DIR_ENV: str(session),
+                    bridge.TIMEOUT_ENV: "2",
+                },
+            )
+        except BaseException as error:  # pragma: no cover - assertion aid
+            errors.append(error)
+
+    worker = threading.Thread(target=invoke)
+    worker.start()
+    request = bridge.wait_for_pending(timeout_seconds=1)
+    assert request is not None
+    assert request["tool_name"] == "Write"
+    assert request["tool_input"]["tool_input_omitted"] is True
+    assert request["tool_input"]["tool_input_bytes"] > bridge.MAX_REQUEST_BYTES
+    assert request["tool_input"]["tool_input_keys"] == ["content", "file_path"]
+
+    listed = bridge.list_pending()
+    assert [item["request_id"] for item in listed] == [request["request_id"]]
+
+    events = bridge.list_pending_events()
+    assert len(events) == 1
+    event_session, event = events[0]
+    assert event_session == session
+    assert event["kind"] == "permission_required"
+    assert event["payload"]["request_id"] == request["request_id"]
+
+    result = bridge.decide(request["request_id"], "deny", "oversized, cannot review")
+    assert result["decision"] == "deny"
+    worker.join(timeout=3)
+
+    assert not worker.is_alive()
+    assert errors == []
+    decision = json.loads(output.getvalue())
+    assert decision["hookSpecificOutput"]["decision"]["behavior"] == "deny"
+    assert bridge.list_pending() == []
 
 
 def test_pending_list_ignores_invalid_and_already_answered_requests(

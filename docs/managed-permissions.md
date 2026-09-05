@@ -37,7 +37,7 @@ A decision applies once. The bridge never returns `updatedPermissions`, never in
 
 - Missing or corrupt state: deny.
 - Invalid hook input: deny.
-- Oversized request: deny.
+- Oversized request: `tool_input` is replaced with `{tool_input_omitted, tool_input_bytes, tool_input_keys}` before the request is recorded, so it still reaches `claude_permission_list` and a `permission_required` event, and Hermes makes an explicit deny through the normal decision path rather than the hook failing closed with no trace.
 - Invalid or duplicate decision: reject the decision; the original request remains denied on timeout.
 - No Hermes decision before the hook deadline: deny and resolve the audit record.
 - Unowned session ID for logs or stop: reject without invoking Claude.
