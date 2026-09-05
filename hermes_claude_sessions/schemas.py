@@ -116,7 +116,9 @@ CLAUDE_SESSION_WAIT: dict[str, object] = {
     "description": (
         "Wait once for the next semantic event from an owned Claude session. "
         "An event returned here is exclusively consumed and will not also trigger "
-        "a fresh Hermes turn."
+        "a fresh Hermes turn. Status is `event`, `timeout`, or `ended`: the "
+        "session's terminal event was already delivered, returned immediately "
+        "with that event; do not wait on the session again."
     ),
     "parameters": {
         "type": "object",

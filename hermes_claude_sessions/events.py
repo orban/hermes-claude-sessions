@@ -379,6 +379,12 @@ class EventDispatcher:
                         if bridge.complete_event_claim(claim, disposition="consumed"):
                             return claim.event
                         bridge.release_event_claim(claim)
+                    settled = self._settled_terminal_event(session)
+                    if settled is not None:
+                        # The session's outcome already left the spool (published as
+                        # a wake or consumed by an earlier wait). Nothing else will
+                        # ever be enqueued for it, so sleeping here can only time out.
+                        return settled
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         timed_out = True
@@ -396,6 +402,40 @@ class EventDispatcher:
         if timed_out:
             self.drain_once()
         return None
+
+    @staticmethod
+    def _settled_terminal_event(session: Path) -> dict[str, Any] | None:
+        """Return the terminal event once it has settled (not pending or claimed)."""
+        event_id = f"terminal-{session.name}"
+        for disposition in bridge.EVENT_DISPOSITIONS:
+            event = bridge._read_json(
+                session / "events" / disposition / f"{event_id}.json"
+            )
+            if event is not None:
+                return {**event, "already_delivered": True}
+        return None
+
+    @staticmethod
+    def _may_claim_for(session: Path) -> bool:
+        """Whether this process may publish wakes for ``session``.
+
+        A wake lands on the publishing process's own completion queue, so a
+        foreign Hermes process that wins the claim strands it. The launching
+        process owns its sessions while alive; once it is gone, only a process of
+        the same role adopts them. Sessions without an owner record predate the
+        rule and stay claimable."""
+        metadata = bridge._read_json(session / "metadata.json")
+        owner = metadata.get("owner") if metadata is not None else None
+        if not isinstance(owner, Mapping):
+            return True
+        pid = owner.get("pid")
+        if isinstance(pid, bool) or not isinstance(pid, int):
+            return True
+        if pid == os.getpid():
+            return True
+        if bridge._pid_is_alive(pid):
+            return False
+        return bridge.host_role() == str(owner.get("role") or "")
 
     @staticmethod
     def _settle_publish_failure(claim: bridge.EventClaim, error: str) -> None:
@@ -416,8 +456,13 @@ class EventDispatcher:
             return 0
         bridge.recover_abandoned_event_claims()
         published = 0
+        claimable: dict[Path, bool] = {}
         for session, event in bridge.list_pending_events():
             if self.waiter_count(session) or bridge.has_active_event_waiter(session):
+                continue
+            if session not in claimable:
+                claimable[session] = self._may_claim_for(session)
+            if not claimable[session]:
                 continue
             event_id = str(event.get("event_id") or "")
             claim = bridge.claim_event(session, event_id, consumer="dispatcher")
