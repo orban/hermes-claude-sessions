@@ -28,6 +28,7 @@ MISSING_NATIVE_GRACE_SECONDS = 120.0
 LAUNCH_INTENT_GRACE_SECONDS = 30.0
 LAUNCH_RECONCILIATION_WINDOW_SECONDS = 5 * 60.0
 CLAIM_STALE_SECONDS = 120.0
+ROSTER_RECHECK_SECONDS = 300.0
 _TERMINAL_STATES = {"completed", "done", "failed", "stopped", "terminated"}
 _MISSING_SNAPSHOT_REASON = "native session was absent before logs could be archived"
 _process_lock = threading.Lock()
@@ -159,6 +160,41 @@ def _roster_state(
     if len(matching) != 1:
         return None, ""
     return True, str(matching[0].get("state") or "")
+
+
+def _roster_seen_path(session: Path) -> Path:
+    return session / "roster-seen"
+
+
+def _mark_roster_seen(session: Path, now: float) -> None:
+    """Record that the roster confirmed this session alive at ``now``."""
+    marker = _roster_seen_path(session)
+    try:
+        marker.touch(exist_ok=True)
+        os.utime(marker, (now, now))
+    except OSError:
+        return
+
+
+def _roster_check_deferred(session: Path, state_hint: str, now: float) -> bool:
+    """Skip the roster while the native record itself says the job is alive.
+
+    Each roster listing spawns ``claude``, which decrypts its credentials from
+    the login keychain. Bound sessions whose own state record is non-terminal
+    only need the roster as a slow backstop for a job that vanished without
+    writing a terminal state, so they are re-checked every
+    ``ROSTER_RECHECK_SECONDS``. A terminal or absent record is never deferred.
+    A marker older than the window, or stamped after ``now`` (clock moved
+    backwards), does not defer either.
+    """
+    if not state_hint or state_hint in _TERMINAL_STATES:
+        return False
+    try:
+        seen = _roster_seen_path(session).stat().st_mtime
+    except OSError:
+        return False
+    age = now - seen
+    return 0.0 <= age < ROSTER_RECHECK_SECONDS
 
 
 def _roster_contains(run: RunCommand, claude_bin: str, native_id: str) -> bool | None:
@@ -714,13 +750,16 @@ def reconcile_terminal_sessions(
                 continue
             if managed is None:
                 continue
-            native_id, _state_file_hint = managed
+            native_id, state_file_hint = managed
+            if _roster_check_deferred(session, state_file_hint, current_time):
+                continue
             present, roster_state = _roster_state(run, claude_bin, native_id)
             if present is None:
                 continue
             native_missing = False
             if present:
                 if roster_state not in _TERMINAL_STATES:
+                    _mark_roster_seen(session, current_time)
                     continue
                 native_state = roster_state
             else:

@@ -1571,11 +1571,59 @@ def test_reconcile_pass_fetches_roster_once_for_all_bound_sessions(
             roster_calls.append(argv)
         return subprocess.CompletedProcess(argv, 0, json.dumps(rows), "")
 
-    lifecycle.reconcile_terminal_sessions("/mock/claude", run=run, now=lambda: 1.0)
+    lifecycle.reconcile_terminal_sessions("/mock/claude", run=run, now=lambda: 1000.0)
     assert len(roster_calls) == 1
 
-    lifecycle.reconcile_terminal_sessions("/mock/claude", run=run, now=lambda: 2.0)
-    assert len(roster_calls) == 2, "memo must not outlive a single pass"
+    lifecycle.reconcile_terminal_sessions("/mock/claude", run=run, now=lambda: 1001.0)
+    assert len(roster_calls) == 1, "a live native record defers the roster"
+
+    lifecycle.reconcile_terminal_sessions("/mock/claude", run=run, now=lambda: 1400.0)
+    assert len(roster_calls) == 2, "the roster backstop sweeps after the window"
+
+
+def test_terminal_native_record_is_never_deferred(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(bridge, "state_root", lambda: tmp_path / "managed")
+    session = _bound_working_session(tmp_path, "finishes", "a1b2c3d4")
+    rows = [{"id": "a1b2c3d4", "state": "working"}]
+    roster_calls: list[list[str]] = []
+
+    def run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if argv[1:] == ["agents", "--json", "--all"]:
+            roster_calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, json.dumps(rows), "")
+
+    lifecycle.reconcile_terminal_sessions("/mock/claude", run=run, now=lambda: 1000.0)
+    assert len(roster_calls) == 1
+
+    rows[0]["state"] = "done"
+    _native_state_path(session).write_text(
+        json.dumps({"state": "done"}), encoding="utf-8"
+    )
+    lifecycle.reconcile_terminal_sessions("/mock/claude", run=run, now=lambda: 1001.0)
+    assert len(roster_calls) == 2, "a terminal record consults the roster at once"
+    assert bridge.list_pending_events(), "terminal event was enqueued"
+
+
+def test_vanished_native_record_is_never_deferred(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(bridge, "state_root", lambda: tmp_path / "managed")
+    session = _bound_working_session(tmp_path, "vanishes", "a1b2c3d4")
+    roster_calls: list[list[str]] = []
+
+    def run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if argv[1:] == ["agents", "--json", "--all"]:
+            roster_calls.append(argv)
+        return subprocess.CompletedProcess(
+            argv, 0, json.dumps([{"id": "a1b2c3d4", "state": "working"}]), ""
+        )
+
+    lifecycle.reconcile_terminal_sessions("/mock/claude", run=run, now=lambda: 1000.0)
+    _native_state_path(session).unlink()
+    lifecycle.reconcile_terminal_sessions("/mock/claude", run=run, now=lambda: 1001.0)
+    assert len(roster_calls) == 2, "an absent record consults the roster at once"
 
 
 def test_memoized_roster_is_invalidated_by_mutating_commands() -> None:
