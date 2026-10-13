@@ -1545,3 +1545,67 @@ def test_uncertain_launch_reports_native_id_ownership_collision(
     assert metadata["launch_detail"] == collision_detail
     assert binding.read_bytes() == binding_before
     assert bridge.find_session("a1b2c3d4") == owner
+
+
+def _bound_working_session(tmp_path: Path, name: str, native_id: str) -> Path:
+    session = bridge.create_session(name, tmp_path)
+    state_path = tmp_path / "jobs" / native_id / "state.json"
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text(json.dumps({"state": "working"}), encoding="utf-8")
+    bridge.set_native_id(session, native_id, native_state_path=state_path)
+    return session
+
+
+def test_reconcile_pass_fetches_roster_once_for_all_bound_sessions(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(bridge, "state_root", lambda: tmp_path / "managed")
+    native_ids = ["a1b2c3d4", "b2c3d4e5", "c3d4e5f6"]
+    for index, native_id in enumerate(native_ids):
+        _bound_working_session(tmp_path, f"bound-{index}", native_id)
+    rows = [{"id": native_id, "state": "working"} for native_id in native_ids]
+    roster_calls: list[list[str]] = []
+
+    def run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if argv[1:] == ["agents", "--json", "--all"]:
+            roster_calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, json.dumps(rows), "")
+
+    lifecycle.reconcile_terminal_sessions("/mock/claude", run=run, now=lambda: 1.0)
+    assert len(roster_calls) == 1
+
+    lifecycle.reconcile_terminal_sessions("/mock/claude", run=run, now=lambda: 2.0)
+    assert len(roster_calls) == 2, "memo must not outlive a single pass"
+
+
+def test_memoized_roster_is_invalidated_by_mutating_commands() -> None:
+    calls: list[list[str]] = []
+
+    def run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "[]", "")
+
+    memoized = lifecycle._memoize_roster(run)
+    roster = ["/mock/claude", "agents", "--json", "--all"]
+    memoized(roster)
+    memoized(roster)
+    assert len(calls) == 1
+    memoized(["/mock/claude", "rm", "a1b2c3d4"])
+    memoized(roster)
+    assert [argv[1] for argv in calls] == ["agents", "rm", "agents"]
+
+
+def test_memoized_roster_does_not_retry_a_failed_listing_within_a_pass() -> None:
+    attempts = 0
+
+    def run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        nonlocal attempts
+        attempts += 1
+        raise subprocess.TimeoutExpired(argv, 20)
+
+    memoized = lifecycle._memoize_roster(run)
+    roster = ["/mock/claude", "agents", "--json", "--all"]
+    for _ in range(3):
+        with pytest.raises(subprocess.TimeoutExpired):
+            memoized(roster)
+    assert attempts == 1

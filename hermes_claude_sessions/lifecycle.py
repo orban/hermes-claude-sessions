@@ -103,6 +103,42 @@ def _run(
         return None
 
 
+_ROSTER_ARGV_SUFFIX = ("agents", "--json", "--all")
+
+
+def _memoize_roster(run: RunCommand) -> RunCommand:
+    """Wrap ``run`` so the native roster is fetched at most once per pass.
+
+    Each roster fetch spawns a ``claude`` process that opens the keychain, and
+    the reconciler used to spawn one per bound session on every wakeup. Only the
+    roster listing is memoized; any other command (``rm``, ``stop``) may have
+    changed the roster, so it clears the memo. Failures are memoized too, so a
+    timed-out listing is not retried for every session in the same pass.
+    """
+    cache: dict[
+        tuple[str, ...],
+        subprocess.CompletedProcess[str] | OSError | subprocess.TimeoutExpired,
+    ] = {}
+
+    def memoized(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        key = tuple(argv)
+        if key[1:] != _ROSTER_ARGV_SUFFIX:
+            cache.clear()
+            return run(argv, **kwargs)
+        if key not in cache:
+            try:
+                cache[key] = run(argv, **kwargs)
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                cache[key] = exc
+                raise
+        cached = cache[key]
+        if isinstance(cached, BaseException):
+            raise cached
+        return cached
+
+    return memoized
+
+
 def _roster_state(
     run: RunCommand, claude_bin: str, native_id: str
 ) -> tuple[bool | None, str]:
@@ -601,6 +637,7 @@ def reconcile_terminal_sessions(
         result["deferred"] += 1
         return result
     try:
+        run = _memoize_roster(run)
         bridge.sweep_stale_atomic_temps(now=now())
         reconcile_uncertain_launches(claude_bin, run=run, now=now)
         bridge.enqueue_native_terminal_events()
